@@ -4,7 +4,7 @@ from itertools import chain
 
 from metaflow import namespace
 from metaflow.client import Flow, Run
-from metaflow.current import current
+from metaflow.metaflow_current import current
 from metaflow.util import resolve_identity
 from metaflow.exception import CommandException, MetaflowNotFound, MetaflowInternalError
 from metaflow.exception import MetaflowNamespaceMismatch
@@ -225,10 +225,7 @@ def _get_client_run_obj(obj, run_id, user_namespace):
 
 
 def _set_current(obj):
-    current._set_env(
-        metadata_str="%s@%s"
-        % (obj.metadata.__class__.TYPE, obj.metadata.__class__.INFO)
-    )
+    current._set_env(metadata_str=obj.metadata.metadata_str())
 
 
 @click.group()
@@ -507,9 +504,9 @@ def tag_list(
 
     if not group_by_run and not group_by_tag:
         # We list all the runs that match to print them out if needed.
-        system_tags_by_some_grouping[
-            ",".join(pathspecs)
-        ] = system_tags_by_some_grouping.get("_", set())
+        system_tags_by_some_grouping[",".join(pathspecs)] = (
+            system_tags_by_some_grouping.get("_", set())
+        )
         all_tags_by_some_grouping[",".join(pathspecs)] = all_tags_by_some_grouping.get(
             "_", set()
         )

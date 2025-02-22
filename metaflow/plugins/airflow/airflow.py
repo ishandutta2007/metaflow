@@ -17,6 +17,7 @@ from metaflow.metaflow_config import (
     AIRFLOW_KUBERNETES_KUBECONFIG_FILE,
     AIRFLOW_KUBERNETES_STARTUP_TIMEOUT_SECONDS,
     AWS_SECRETS_MANAGER_DEFAULT_REGION,
+    GCP_SECRET_MANAGER_PREFIX,
     AZURE_STORAGE_BLOB_SERVICE_ENDPOINT,
     CARD_AZUREROOT,
     CARD_GSROOT,
@@ -31,6 +32,7 @@ from metaflow.metaflow_config import (
     S3_ENDPOINT_URL,
     SERVICE_HEADERS,
     SERVICE_INTERNAL_URL,
+    AZURE_KEY_VAULT_PREFIX,
 )
 
 from metaflow.metaflow_config_funcs import config_values
@@ -44,6 +46,7 @@ from metaflow.parameters import (
 # TODO: Move chevron to _vendor
 from metaflow.plugins.cards.card_modules import chevron
 from metaflow.plugins.kubernetes.kubernetes import Kubernetes
+from metaflow.plugins.kubernetes.kube_utils import qos_requests_and_limits
 from metaflow.plugins.timeout_decorator import get_run_time_limit_for_task
 from metaflow.util import compress_list, dict_to_cli_options, get_username
 
@@ -397,17 +400,22 @@ class Airflow(object):
             "METAFLOW_CARD_GSROOT": CARD_GSROOT,
             "METAFLOW_S3_ENDPOINT_URL": S3_ENDPOINT_URL,
         }
-        env[
-            "METAFLOW_AZURE_STORAGE_BLOB_SERVICE_ENDPOINT"
-        ] = AZURE_STORAGE_BLOB_SERVICE_ENDPOINT
+        env["METAFLOW_AZURE_STORAGE_BLOB_SERVICE_ENDPOINT"] = (
+            AZURE_STORAGE_BLOB_SERVICE_ENDPOINT
+        )
         env["METAFLOW_DATASTORE_SYSROOT_AZURE"] = DATASTORE_SYSROOT_AZURE
         env["METAFLOW_CARD_AZUREROOT"] = CARD_AZUREROOT
         if DEFAULT_SECRETS_BACKEND_TYPE:
             env["METAFLOW_DEFAULT_SECRETS_BACKEND_TYPE"] = DEFAULT_SECRETS_BACKEND_TYPE
         if AWS_SECRETS_MANAGER_DEFAULT_REGION:
-            env[
-                "METAFLOW_AWS_SECRETS_MANAGER_DEFAULT_REGION"
-            ] = AWS_SECRETS_MANAGER_DEFAULT_REGION
+            env["METAFLOW_AWS_SECRETS_MANAGER_DEFAULT_REGION"] = (
+                AWS_SECRETS_MANAGER_DEFAULT_REGION
+            )
+        if GCP_SECRET_MANAGER_PREFIX:
+            env["METAFLOW_GCP_SECRET_MANAGER_PREFIX"] = GCP_SECRET_MANAGER_PREFIX
+
+        if AZURE_KEY_VAULT_PREFIX:
+            env["METAFLOW_AZURE_KEY_VAULT_PREFIX"] = AZURE_KEY_VAULT_PREFIX
 
         env.update(additional_mf_variables)
 
@@ -421,25 +429,25 @@ class Airflow(object):
             if k8s_deco.attributes["namespace"] is not None
             else "default"
         )
-
-        resources = dict(
-            requests={
-                "cpu": k8s_deco.attributes["cpu"],
-                "memory": "%sM" % str(k8s_deco.attributes["memory"]),
-                "ephemeral-storage": str(k8s_deco.attributes["disk"]),
-            }
+        qos_requests, qos_limits = qos_requests_and_limits(
+            k8s_deco.attributes["qos"],
+            k8s_deco.attributes["cpu"],
+            k8s_deco.attributes["memory"],
+            k8s_deco.attributes["disk"],
         )
-        if k8s_deco.attributes["gpu"] is not None:
-            resources.update(
-                dict(
-                    limits={
-                        "%s.com/gpu".lower()
-                        % k8s_deco.attributes["gpu_vendor"]: str(
-                            k8s_deco.attributes["gpu"]
-                        )
-                    }
-                )
-            )
+        resources = dict(
+            requests=qos_requests,
+            limits={
+                **qos_limits,
+                **{
+                    "%s.com/gpu".lower()
+                    % k8s_deco.attributes["gpu_vendor"]: str(k8s_deco.attributes["gpu"])
+                    for k in [0]
+                    # Don't set GPU limits if gpu isn't specified.
+                    if k8s_deco.attributes["gpu"] is not None
+                },
+            },
+        )
 
         annotations = {
             "metaflow/production_token": self.production_token,
@@ -532,7 +540,7 @@ class Airflow(object):
         # FlowDecorators can define their own top-level options. They are
         # responsible for adding their own top-level options and values through
         # the get_top_level_options() hook. See similar logic in runtime.py.
-        for deco in flow_decorators():
+        for deco in flow_decorators(self.flow):
             top_opts_dict.update(deco.get_top_level_options())
 
         top_opts = list(dict_to_cli_options(top_opts_dict))

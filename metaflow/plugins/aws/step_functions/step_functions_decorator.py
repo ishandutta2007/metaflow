@@ -1,9 +1,8 @@
 import os
-import json
 import time
 
 from metaflow.decorators import StepDecorator
-from metaflow.metadata import MetaDatum
+from metaflow.metadata_provider import MetaDatum
 
 from .dynamo_db_client import DynamoDbClient
 

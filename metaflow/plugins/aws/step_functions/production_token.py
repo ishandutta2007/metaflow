@@ -1,9 +1,9 @@
-import os
 import json
+import os
 import random
 import string
 import zlib
-from itertools import dropwhile, islice
+from itertools import dropwhile
 
 from metaflow.util import to_bytes
 

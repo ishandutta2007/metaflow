@@ -1,13 +1,13 @@
 import json
 import os
-import time
+
 
 from metaflow import current
 from metaflow.decorators import StepDecorator
 from metaflow.events import Trigger
-from metaflow.metadata import MetaDatum
-from metaflow.metaflow_config import ARGO_EVENTS_WEBHOOK_URL
-
+from metaflow.metadata_provider import MetaDatum
+from metaflow.graph import FlowGraph
+from metaflow.flowspec import FlowSpec
 from .argo_events import ArgoEvent
 
 
@@ -40,7 +40,7 @@ class ArgoWorkflowsInternalDecorator(StepDecorator):
                 if payload != "null":  # Argo-Workflow's None
                     try:
                         payload = json.loads(payload)
-                    except (TypeError, ValueError) as e:
+                    except (TypeError, ValueError):
                         # There could be arbitrary events that Metaflow doesn't know of
                         payload = {}
                     triggers.append(
@@ -52,7 +52,7 @@ class ArgoWorkflowsInternalDecorator(StepDecorator):
                                 "_", 1
                             )[
                                 0
-                            ]  # infer type from env var key
+                            ],  # infer type from env var key
                             # Add more event metadata here in the future
                         }
                     )
@@ -72,6 +72,7 @@ class ArgoWorkflowsInternalDecorator(StepDecorator):
         meta["argo-workflow-name"] = os.environ["ARGO_WORKFLOW_NAME"]
         meta["argo-workflow-namespace"] = os.environ["ARGO_WORKFLOW_NAMESPACE"]
         meta["auto-emit-argo-events"] = self.attributes["auto-emit-argo-events"]
+        meta["argo-workflow-template-owner"] = os.environ["METAFLOW_OWNER"]
         entries = [
             MetaDatum(
                 field=k, value=v, type=k, tags=["attempt_id:{0}".format(retry_count)]
@@ -82,7 +83,13 @@ class ArgoWorkflowsInternalDecorator(StepDecorator):
         metadata.register_metadata(run_id, step_name, task_id, entries)
 
     def task_finished(
-        self, step_name, flow, graph, is_task_ok, retry_count, max_user_code_retries
+        self,
+        step_name,
+        flow: FlowSpec,
+        graph: FlowGraph,
+        is_task_ok,
+        retry_count,
+        max_user_code_retries,
     ):
         if not is_task_ok:
             # The task finished with an exception - execution won't
@@ -99,13 +106,32 @@ class ArgoWorkflowsInternalDecorator(StepDecorator):
         # we run pods with a security context. We work around this constraint by
         # mounting an emptyDir volume.
         if graph[step_name].type == "foreach":
+            if graph[step_name].parallel_foreach:
+                # If a node is marked as a `parallel_foreach`, pass down the value of
+                # `num_parallel` to the subsequent steps.
+                with open("/mnt/out/num_parallel", "w") as f:
+                    json.dump(flow._parallel_ubf_iter.num_parallel, f)
+                # Set splits to 1 since parallelism is handled by JobSet.
+                flow._foreach_num_splits = 1
+                with open("/mnt/out/task_id_entropy", "w") as file:
+                    import uuid
+
+                    file.write(uuid.uuid4().hex[:6])
+
             with open("/mnt/out/splits", "w") as file:
                 json.dump(list(range(flow._foreach_num_splits)), file)
-        # Unfortunately, we can't always use pod names as task-ids since the pod names
-        # are not static across retries. We write the task-id to a file that is read
-        # by the next task here.
-        with open("/mnt/out/task_id", "w") as file:
-            file.write(self.task_id)
+            with open("/mnt/out/split_cardinality", "w") as file:
+                json.dump(flow._foreach_num_splits, file)
+
+        # For steps that have a `@parallel` decorator set to them, we will be relying on Jobsets
+        # to run the task. In this case, we cannot set anything in the
+        # `/mnt/out` directory, since such form of output mounts are not available to Jobset executions.
+        if not graph[step_name].parallel_step:
+            # Unfortunately, we can't always use pod names as task-ids since the pod names
+            # are not static across retries. We write the task-id to a file that is read
+            # by the next task here.
+            with open("/mnt/out/task_id", "w") as file:
+                file.write(self.task_id)
 
         # Emit Argo Events given that the flow has succeeded. Given that we only
         # emit events when the task succeeds, we can piggy back on this decorator

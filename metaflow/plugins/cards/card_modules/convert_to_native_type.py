@@ -44,7 +44,7 @@ def _full_classname(obj):
 
 
 class TaskToDict:
-    def __init__(self, only_repr=False):
+    def __init__(self, only_repr=False, runtime=False):
         # this dictionary holds all the supported functions
         import reprlib
         import pprint
@@ -59,6 +59,7 @@ class TaskToDict:
         r.maxlist = 100
         r.maxlevel = 3
         self._repr = r
+        self._runtime = runtime
         self._only_repr = only_repr
         self._supported_types = {
             "tuple": self._parse_tuple,
@@ -90,11 +91,16 @@ class TaskToDict:
             stderr=task.stderr,
             stdout=task.stdout,
             created_at=task.created_at.strftime(TIME_FORMAT),
-            finished_at=task.finished_at.strftime(TIME_FORMAT),
+            finished_at=None,
             pathspec=task.pathspec,
             graph=graph,
             data={},
         )
+        if not self._runtime:
+            if task.finished_at is not None:
+                task_dict.update(
+                    dict(finished_at=task.finished_at.strftime(TIME_FORMAT))
+                )
         task_dict["data"], type_infered_objects = self._create_task_data_dict(task)
         task_dict.update(type_infered_objects)
         return task_dict
@@ -308,9 +314,9 @@ class TaskToDict:
         # If there is any form of TypeError or ValueError we set the column value to "Unsupported Type"
         # We also set columns which are have null values to "null" strings
         time_format = "%Y-%m-%dT%H:%M:%S%Z"
-        truncate_long_objects = (
-            lambda x: x.astype("string").str.slice(0, 30) + "..."
-            if x.astype("string").str.len().max() > 30
+        truncate_long_objects = lambda x: (
+            x.astype("string").str.slice(0, 30) + "..."
+            if len(x) > 0 and x.astype("string").str.len().max() > 30
             else x.astype("string")
         )
         type_parser = {
@@ -348,12 +354,12 @@ class TaskToDict:
         try:
             col_type = str(column_object.dtype)
             if col_type in type_parser:
-                return type_parser[col_type](column_object)
+                return type_parser[col_type](column_object.fillna("null"))
             else:
                 parsed_col = _match_partial_type()
                 if parsed_col is not None:
-                    return parsed_col
-            return truncate_long_objects(column_object)
+                    return parsed_col.fillna("null")
+            return truncate_long_objects(column_object.fillna("null"))
         except ValueError as e:
             return "Unsupported type: {0}".format(col_type)
         except TypeError as e:

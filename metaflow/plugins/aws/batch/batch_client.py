@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
-from collections import defaultdict, deque
+from collections import defaultdict
 import copy
 import random
-import select
-import sys
 import time
 import hashlib
 
@@ -89,6 +87,9 @@ class BatchJob(object):
         # Multinode
         if getattr(self, "num_parallel", 0) >= 1:
             num_nodes = self.num_parallel
+            # We need this task-id set so that all the nodes are aware of the control
+            # task's task-id. These "MF_" variables populate the `current.parallel` namedtuple
+            self.environment_variable("MF_PARALLEL_CONTROL_TASK_ID", self._task_id)
             main_task_override = copy.deepcopy(self.payload["containerOverrides"])
 
             # main
@@ -152,11 +153,15 @@ class BatchJob(object):
         efa,
         memory,
         host_volumes,
+        efs_volumes,
         use_tmpfs,
         tmpfs_tempdir,
         tmpfs_size,
         tmpfs_path,
         num_parallel,
+        ephemeral_storage,
+        log_driver,
+        log_options,
     ):
         # identify platform from any compute environment associated with the
         # queue
@@ -194,6 +199,25 @@ class BatchJob(object):
             "propagateTags": True,
         }
 
+        log_options_dict = {}
+        if log_options:
+            if isinstance(log_options, str):
+                log_options = [log_options]
+            for each_log_option in log_options:
+                k, v = each_log_option.split(":", 1)
+                log_options_dict[k] = v
+
+        if log_driver or log_options:
+            job_definition["containerProperties"]["logConfiguration"] = {}
+        if log_driver:
+            job_definition["containerProperties"]["logConfiguration"][
+                "logDriver"
+            ] = log_driver
+        if log_options:
+            job_definition["containerProperties"]["logConfiguration"][
+                "options"
+            ] = log_options_dict
+
         if platform == "FARGATE" or platform == "FARGATE_SPOT":
             if num_parallel > 1:
                 raise BatchJobException("Fargate does not support multinode jobs.")
@@ -209,6 +233,10 @@ class BatchJob(object):
             job_definition["containerProperties"]["networkConfiguration"] = {
                 "assignPublicIp": "ENABLED"
             }
+            if ephemeral_storage:
+                job_definition["containerProperties"]["ephemeralStorage"] = {
+                    "sizeInGiB": ephemeral_storage
+                }
 
         if platform == "EC2" or platform == "SPOT":
             if "linuxParameters" not in job_definition["containerProperties"]:
@@ -253,6 +281,10 @@ class BatchJob(object):
                     job_definition["containerProperties"]["linuxParameters"][
                         "maxSwap"
                     ] = int(max_swap)
+            if ephemeral_storage:
+                raise BatchJobException(
+                    "The ephemeral_storage parameter is only available for FARGATE compute environments"
+                )
 
         if inferentia:
             if not (isinstance(inferentia, (int, unicode, basestring))):
@@ -270,24 +302,54 @@ class BatchJob(object):
                         {
                             "containerPath": "/dev/neuron{}".format(i),
                             "hostPath": "/dev/neuron{}".format(i),
-                            "permissions": ["read", "write"],
+                            "permissions": ["READ", "WRITE"],
                         }
                     )
 
-        if host_volumes:
+        if host_volumes or efs_volumes:
             job_definition["containerProperties"]["volumes"] = []
             job_definition["containerProperties"]["mountPoints"] = []
-            if isinstance(host_volumes, str):
-                host_volumes = [host_volumes]
-            for host_path in host_volumes:
-                name = host_path.replace("/", "_").replace(".", "_")
-                job_definition["containerProperties"]["volumes"].append(
-                    {"name": name, "host": {"sourcePath": host_path}}
-                )
-                job_definition["containerProperties"]["mountPoints"].append(
-                    {"sourceVolume": name, "containerPath": host_path}
-                )
 
+            if host_volumes:
+                if isinstance(host_volumes, str):
+                    host_volumes = [host_volumes]
+                for host_path in host_volumes:
+                    container_path = host_path
+                    if ":" in host_path:
+                        host_path, container_path = host_path.split(":", 1)
+                    name = host_path.replace("/", "_").replace(".", "_")
+                    job_definition["containerProperties"]["volumes"].append(
+                        {"name": name, "host": {"sourcePath": host_path}}
+                    )
+                    job_definition["containerProperties"]["mountPoints"].append(
+                        {"sourceVolume": name, "containerPath": container_path}
+                    )
+
+            if efs_volumes:
+                if isinstance(efs_volumes, str):
+                    efs_volumes = [efs_volumes]
+                for efs_id in efs_volumes:
+                    container_path = "/mnt/" + efs_id
+                    if ":" in efs_id:
+                        efs_id, container_path = efs_id.split(":", 1)
+                    name = "efs_" + efs_id
+                    job_definition["containerProperties"]["volumes"].append(
+                        {
+                            "name": name,
+                            "efsVolumeConfiguration": {
+                                "fileSystemId": efs_id,
+                                "transitEncryption": "ENABLED",
+                            },
+                        }
+                    )
+                    job_definition["containerProperties"]["mountPoints"].append(
+                        {"sourceVolume": name, "containerPath": container_path}
+                    )
+
+        if use_tmpfs and (platform == "FARGATE" or platform == "FARGATE_SPOT"):
+            raise BatchJobException(
+                "tmpfs is not available for Fargate compute resources"
+            )
         if use_tmpfs or (tmpfs_size and not use_tmpfs):
             if tmpfs_size:
                 if not (isinstance(tmpfs_size, (int, unicode, basestring))):
@@ -317,7 +379,15 @@ class BatchJob(object):
                     "Invalid efa value: ({}) (should be 0 or greater)".format(efa)
                 )
             else:
-                job_definition["containerProperties"]["linuxParameters"]["devices"] = []
+                if "linuxParameters" not in job_definition["containerProperties"]:
+                    job_definition["containerProperties"]["linuxParameters"] = {}
+                if (
+                    "devices"
+                    not in job_definition["containerProperties"]["linuxParameters"]
+                ):
+                    job_definition["containerProperties"]["linuxParameters"][
+                        "devices"
+                    ] = []
                 if (num_parallel or 0) > 1:
                     # Multi-node parallel jobs require the container path and permissions explicitly specified in Job definition
                     for i in range(int(efa)):
@@ -401,11 +471,15 @@ class BatchJob(object):
         efa,
         memory,
         host_volumes,
+        efs_volumes,
         use_tmpfs,
         tmpfs_tempdir,
         tmpfs_size,
         tmpfs_path,
         num_parallel,
+        ephemeral_storage,
+        log_driver,
+        log_options,
     ):
         self.payload["jobDefinition"] = self._register_job_definition(
             image,
@@ -419,11 +493,15 @@ class BatchJob(object):
             efa,
             memory,
             host_volumes,
+            efs_volumes,
             use_tmpfs,
             tmpfs_tempdir,
             tmpfs_size,
             tmpfs_path,
             num_parallel,
+            ephemeral_storage,
+            log_driver,
+            log_options,
         )
         return self
 

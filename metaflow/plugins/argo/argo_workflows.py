@@ -6,10 +6,12 @@ import shlex
 import sys
 from collections import defaultdict
 from hashlib import sha1
+from math import inf
 
 from metaflow import JSONType, current
 from metaflow.decorators import flow_decorators
 from metaflow.exception import MetaflowException
+from metaflow.graph import FlowGraph
 from metaflow.includefile import FilePathClass
 from metaflow.metaflow_config import (
     ARGO_EVENTS_EVENT,
@@ -18,10 +20,12 @@ from metaflow.metaflow_config import (
     ARGO_EVENTS_INTERNAL_WEBHOOK_URL,
     ARGO_EVENTS_SERVICE_ACCOUNT,
     ARGO_EVENTS_WEBHOOK_AUTH,
+    ARGO_WORKFLOWS_CAPTURE_ERROR_SCRIPT,
     ARGO_WORKFLOWS_ENV_VARS_TO_SKIP,
     ARGO_WORKFLOWS_KUBERNETES_SECRETS,
     ARGO_WORKFLOWS_UI_URL,
     AWS_SECRETS_MANAGER_DEFAULT_REGION,
+    AZURE_KEY_VAULT_PREFIX,
     AZURE_STORAGE_BLOB_SERVICE_ENDPOINT,
     CARD_AZUREROOT,
     CARD_GSROOT,
@@ -32,10 +36,9 @@ from metaflow.metaflow_config import (
     DATATOOLS_S3ROOT,
     DEFAULT_METADATA,
     DEFAULT_SECRETS_BACKEND_TYPE,
+    GCP_SECRET_MANAGER_PREFIX,
     KUBERNETES_FETCH_EC2_METADATA,
-    KUBERNETES_LABELS,
     KUBERNETES_NAMESPACE,
-    KUBERNETES_NODE_SELECTOR,
     KUBERNETES_SANDBOX_INIT_SCRIPT,
     KUBERNETES_SECRETS,
     S3_ENDPOINT_URL,
@@ -47,10 +50,11 @@ from metaflow.metaflow_config import (
 from metaflow.metaflow_config_funcs import config_values
 from metaflow.mflog import BASH_SAVE_LOGS, bash_capture_logs, export_mflog_env_vars
 from metaflow.parameters import deploy_time_eval
-from metaflow.plugins.kubernetes.kubernetes import (
-    parse_kube_keyvalue_list,
-    validate_kube_labels,
-)
+from metaflow.plugins.kubernetes.kube_utils import qos_requests_and_limits
+
+from metaflow.plugins.kubernetes.kubernetes_jobsets import KubernetesArgoJobSet
+from metaflow.unbounded_foreach import UBF_CONTROL, UBF_TASK
+from metaflow.user_configs.config_options import ConfigInput
 from metaflow.util import (
     compress_list,
     dict_to_cli_options,
@@ -73,20 +77,16 @@ class ArgoWorkflowsSchedulingException(MetaflowException):
 # List of future enhancements -
 #     1. Configure Argo metrics.
 #     2. Support resuming failed workflows within Argo Workflows.
-#     3. Support gang-scheduled clusters for distributed PyTorch/TF - One option is to
-#        use volcano - https://github.com/volcano-sh/volcano/tree/master/example/integrations/argo
-#     4. Support GitOps workflows.
-#     5. Add Metaflow tags to labels/annotations.
-#     6. Support Multi-cluster scheduling - https://github.com/argoproj/argo-workflows/issues/3523#issuecomment-792307297
-#     7. Support R lang.
-#     8. Ping @savin at slack.outerbounds.co for any feature request.
+#     3. Add Metaflow tags to labels/annotations.
+#     4. Support R lang.
+#     5. Ping @savin at slack.outerbounds.co for any feature request
 
 
 class ArgoWorkflows(object):
     def __init__(
         self,
         name,
-        graph,
+        graph: FlowGraph,
         flow,
         code_package_sha,
         code_package_url,
@@ -107,6 +107,11 @@ class ArgoWorkflows(object):
         notify_on_success=False,
         notify_slack_webhook_url=None,
         notify_pager_duty_integration_key=None,
+        notify_incident_io_api_key=None,
+        incident_io_success_severity_id=None,
+        incident_io_error_severity_id=None,
+        enable_heartbeat_daemon=True,
+        enable_error_msg_capture=False,
     ):
         # Some high-level notes -
         #
@@ -154,12 +159,18 @@ class ArgoWorkflows(object):
         self.notify_on_success = notify_on_success
         self.notify_slack_webhook_url = notify_slack_webhook_url
         self.notify_pager_duty_integration_key = notify_pager_duty_integration_key
-
+        self.notify_incident_io_api_key = notify_incident_io_api_key
+        self.incident_io_success_severity_id = incident_io_success_severity_id
+        self.incident_io_error_severity_id = incident_io_error_severity_id
+        self.enable_heartbeat_daemon = enable_heartbeat_daemon
+        self.enable_error_msg_capture = enable_error_msg_capture
         self.parameters = self._process_parameters()
+        self.config_parameters = self._process_config_parameters()
         self.triggers, self.trigger_options = self._process_triggers()
         self._schedule, self._timezone = self._get_schedule()
 
-        self.kubernetes_labels = self._get_kubernetes_labels()
+        self._base_labels = self._base_kubernetes_labels()
+        self._base_annotations = self._base_kubernetes_annotations()
         self._workflow_template = self._compile_workflow_template()
         self._sensor = self._compile_sensor()
 
@@ -181,6 +192,12 @@ class ArgoWorkflows(object):
         # Workflow template names - so we swap them with hyphens which are not
         # allowed by Metaflow - guaranteeing uniqueness.
         return name.replace("_", "-")
+
+    @staticmethod
+    def _sensor_name(name):
+        # Unfortunately, Argo Events Sensor names don't allow for
+        # dots (sensors run into an error) which rules out self.name :(
+        return name.replace(".", "-")
 
     @staticmethod
     def list_templates(flow_name, all=False):
@@ -214,7 +231,7 @@ class ArgoWorkflows(object):
 
         # The workflow might have sensors attached to it, which consume actual resources.
         # Try to delete these as well.
-        sensor_deleted = client.delete_sensor(name)
+        sensor_deleted = client.delete_sensor(ArgoWorkflows._sensor_name(name))
 
         # After cleaning up related resources, delete the workflow in question.
         # Failure in deleting is treated as critical and will be made visible to the user
@@ -227,8 +244,8 @@ class ArgoWorkflows(object):
 
         return schedule_deleted, sensor_deleted, workflow_deleted
 
-    @staticmethod
-    def terminate(flow_name, name):
+    @classmethod
+    def terminate(cls, flow_name, name):
         client = ArgoClient(namespace=KUBERNETES_NAMESPACE)
 
         response = client.terminate_workflow(name)
@@ -290,7 +307,7 @@ class ArgoWorkflows(object):
             try:
                 # Check that the workflow was deployed through Metaflow
                 workflow_template["metadata"]["annotations"]["metaflow/owner"]
-            except KeyError as e:
+            except KeyError:
                 raise ArgoWorkflowsException(
                     "An existing non-metaflow workflow with the same name as "
                     "*%s* already exists in Argo Workflows. \nPlease modify the "
@@ -304,18 +321,42 @@ class ArgoWorkflows(object):
         except Exception as e:
             raise ArgoWorkflowsException(str(e))
 
-    @staticmethod
-    def _get_kubernetes_labels():
+    def _base_kubernetes_labels(self):
         """
-        Get Kubernetes labels from environment variable.
-        Parses the string into a dict and validates that values adhere to Kubernetes restrictions.
+        Get shared Kubernetes labels for Argo resources.
         """
-        if not KUBERNETES_LABELS:
-            return {}
-        env_labels = KUBERNETES_LABELS.split(",")
-        env_labels = parse_kube_keyvalue_list(env_labels, False)
-        validate_kube_labels(env_labels)
-        return env_labels
+        # TODO: Add configuration through an environment variable or Metaflow config in the future if required.
+        labels = {"app.kubernetes.io/part-of": "metaflow"}
+
+        return labels
+
+    def _base_kubernetes_annotations(self):
+        """
+        Get shared Kubernetes annotations for Argo resources.
+        """
+        from datetime import datetime, timezone
+
+        # TODO: Add configuration through an environment variable or Metaflow config in the future if required.
+        # base annotations
+        annotations = {
+            "metaflow/production_token": self.production_token,
+            "metaflow/owner": self.username,
+            "metaflow/user": "argo-workflows",
+            "metaflow/flow_name": self.flow.name,
+            "metaflow/deployment_timestamp": str(
+                datetime.now(timezone.utc).isoformat()
+            ),
+        }
+
+        if current.get("project_name"):
+            annotations.update(
+                {
+                    "metaflow/project_name": current.project_name,
+                    "metaflow/branch_name": current.branch_name,
+                    "metaflow/project_flow_name": current.project_flow_name,
+                }
+            )
+        return annotations
 
     def _get_schedule(self):
         schedule = self.flow._flow_decorators.get("schedule")
@@ -331,10 +372,9 @@ class ArgoWorkflows(object):
             argo_client.schedule_workflow_template(
                 self.name, self._schedule, self._timezone
             )
-            # Register sensor. Unfortunately, Argo Events Sensor names don't allow for
-            # dots (sensors run into an error) which rules out self.name :(
+            # Register sensor.
             # Metaflow will overwrite any existing sensor.
-            sensor_name = self.name.replace(".", "-")
+            sensor_name = ArgoWorkflows._sensor_name(self.name)
             if self._sensor:
                 argo_client.register_sensor(sensor_name, self._sensor.to_json())
             else:
@@ -392,7 +432,7 @@ class ArgoWorkflows(object):
                         "metaflow/production_token"
                     ],
                 )
-            except KeyError as e:
+            except KeyError:
                 raise ArgoWorkflowsException(
                     "An existing non-metaflow workflow with the same name as "
                     "*%s* already exists in Argo Workflows. \nPlease modify the "
@@ -438,12 +478,22 @@ class ArgoWorkflows(object):
                     "case-insensitive." % param.name
                 )
             seen.add(norm)
+            # NOTE: We skip config parameters as these do not have dynamic values,
+            # and need to be treated differently.
+            if param.IS_CONFIG_PARAMETER:
+                continue
 
-            if param.kwargs.get("type") == JSONType or isinstance(
-                param.kwargs.get("type"), FilePathClass
-            ):
-                # Special-case this to avoid touching core
+            extra_attrs = {}
+            if param.kwargs.get("type") == JSONType:
                 param_type = str(param.kwargs.get("type").name)
+            elif isinstance(param.kwargs.get("type"), FilePathClass):
+                param_type = str(param.kwargs.get("type").name)
+                extra_attrs["is_text"] = getattr(
+                    param.kwargs.get("type"), "_is_text", True
+                )
+                extra_attrs["encoding"] = getattr(
+                    param.kwargs.get("type"), "_encoding", "utf-8"
+                )
             else:
                 param_type = str(param.kwargs.get("type").__name__)
 
@@ -465,12 +515,35 @@ class ArgoWorkflows(object):
             # execution - which needs to be fixed imminently.
             if not is_required or default_value is not None:
                 default_value = json.dumps(default_value)
+
             parameters[param.name] = dict(
                 name=param.name,
                 value=default_value,
                 type=param_type,
                 description=param.kwargs.get("help"),
                 is_required=is_required,
+                **extra_attrs
+            )
+        return parameters
+
+    def _process_config_parameters(self):
+        parameters = []
+        seen = set()
+        for var, param in self.flow._get_parameters():
+            if not param.IS_CONFIG_PARAMETER:
+                continue
+            # Throw an exception if the parameter is specified twice.
+            norm = param.name.lower()
+            if norm in seen:
+                raise MetaflowException(
+                    "Parameter *%s* is specified twice. "
+                    "Note that parameter names are "
+                    "case-insensitive." % param.name
+                )
+            seen.add(norm)
+
+            parameters.append(
+                dict(name=param.name, kv_name=ConfigInput.make_key_name(param.name))
             )
         return parameters
 
@@ -496,10 +569,17 @@ class ArgoWorkflows(object):
             # convert them to lower case since Metaflow parameters are case
             # insensitive.
             seen = set()
+            # NOTE: We skip config parameters as their values can not be set through event payloads
             params = set(
-                [param.name.lower() for var, param in self.flow._get_parameters()]
+                [
+                    param.name.lower()
+                    for var, param in self.flow._get_parameters()
+                    if not param.IS_CONFIG_PARAMETER
+                ]
             )
-            for event in self.flow._flow_decorators.get("trigger")[0].triggers:
+            trigger_deco = self.flow._flow_decorators.get("trigger")[0]
+            trigger_deco.format_deploytime_value()
+            for event in trigger_deco.triggers:
                 parameters = {}
                 # TODO: Add a check to guard against names starting with numerals(?)
                 if not re.match(r"^[A-Za-z0-9_.-]+$", event["name"]):
@@ -539,11 +619,23 @@ class ArgoWorkflows(object):
 
         # @trigger_on_finish decorator
         if self.flow._flow_decorators.get("trigger_on_finish"):
-            for event in self.flow._flow_decorators.get("trigger_on_finish")[
-                0
-            ].triggers:
+            trigger_on_finish_deco = self.flow._flow_decorators.get(
+                "trigger_on_finish"
+            )[0]
+            trigger_on_finish_deco.format_deploytime_value()
+            for event in trigger_on_finish_deco.triggers:
                 # Actual filters are deduced here since we don't have access to
                 # the current object in the @trigger_on_finish decorator.
+                project_name = event.get("project") or current.get("project_name")
+                branch_name = event.get("branch") or current.get("branch_name")
+                # validate that we have complete project info for an event name
+                if project_name or branch_name:
+                    if not (project_name and branch_name):
+                        # if one of the two is missing, we would end up listening to an event that will never be broadcast.
+                        raise ArgoWorkflowsException(
+                            "Incomplete project info. Please specify both 'project' and 'project_branch' or use the @project decorator"
+                        )
+
                 triggers.append(
                     {
                         # Make sure this remains consistent with the event name format
@@ -552,18 +644,16 @@ class ArgoWorkflows(object):
                         % ".".join(
                             v
                             for v in [
-                                event.get("project") or current.get("project_name"),
-                                event.get("branch") or current.get("branch_name"),
+                                project_name,
+                                branch_name,
                                 event["flow"],
                             ]
                             if v
                         ),
                         "filters": {
                             "auto-generated-by-metaflow": True,
-                            "project_name": event.get("project")
-                            or current.get("project_name"),
-                            "branch_name": event.get("branch")
-                            or current.get("branch_name"),
+                            "project_name": project_name,
+                            "branch_name": branch_name,
                             # TODO: Add a time filters to guard against cached events
                         },
                         "type": "run",
@@ -615,24 +705,17 @@ class ArgoWorkflows(object):
         # generate container templates at the top level (in WorkflowSpec) and maintain
         # references to them within the DAGTask.
 
-        annotations = {
-            "metaflow/production_token": self.production_token,
-            "metaflow/owner": self.username,
-            "metaflow/user": "argo-workflows",
-            "metaflow/flow_name": self.flow.name,
-        }
+        annotations = {}
+        if self._schedule is not None:
+            # timezone is an optional field and json dumps on None will result in null
+            # hence configuring it to an empty string
+            if self._timezone is None:
+                self._timezone = ""
+            cron_info = {"schedule": self._schedule, "tz": self._timezone}
+            annotations.update({"metaflow/cron": json.dumps(cron_info)})
 
         if self.parameters:
             annotations.update({"metaflow/parameters": json.dumps(self.parameters)})
-
-        if current.get("project_name"):
-            annotations.update(
-                {
-                    "metaflow/project_name": current.project_name,
-                    "metaflow/branch_name": current.branch_name,
-                    "metaflow/project_flow_name": current.project_flow_name,
-                }
-            )
 
         # Some more annotations to populate the Argo UI nicely
         if self.tags:
@@ -655,6 +738,7 @@ class ArgoWorkflows(object):
                         {
                             "slack": bool(self.notify_slack_webhook_url),
                             "pager_duty": bool(self.notify_pager_duty_integration_key),
+                            "incident_io": bool(self.notify_incident_io_api_key),
                         }
                     )
                 }
@@ -666,10 +750,22 @@ class ArgoWorkflows(object):
                         {
                             "slack": bool(self.notify_slack_webhook_url),
                             "pager_duty": bool(self.notify_pager_duty_integration_key),
+                            "incident_io": bool(self.notify_incident_io_api_key),
                         }
                     )
                 }
             )
+        try:
+            # Build the DAG based on the DAGNodes given by the FlowGraph for the found FlowSpec class.
+            _steps_info, graph_structure = self.graph.output_steps()
+            graph_info = {
+                # for the time being, we only need the graph_structure. Being mindful of annotation size limits we do not include anything extra.
+                "graph_structure": graph_structure
+            }
+        except Exception:
+            graph_info = None
+
+        dag_annotation = {"metaflow/dag": json.dumps(graph_info)}
 
         return (
             WorkflowTemplate()
@@ -681,9 +777,11 @@ class ArgoWorkflows(object):
                 # is released, we should be able to support multi-namespace /
                 # multi-cluster scheduling.
                 .namespace(KUBERNETES_NAMESPACE)
-                .label("app.kubernetes.io/name", "metaflow-flow")
-                .label("app.kubernetes.io/part-of", "metaflow")
                 .annotations(annotations)
+                .annotations(self._base_annotations)
+                .labels(self._base_labels)
+                .label("app.kubernetes.io/name", "metaflow-flow")
+                .annotations(dag_annotation)
             )
             .spec(
                 WorkflowSpec()
@@ -713,10 +811,14 @@ class ArgoWorkflows(object):
                 # Set workflow metadata
                 .workflow_metadata(
                     Metadata()
+                    .labels(self._base_labels)
                     .label("app.kubernetes.io/name", "metaflow-run")
-                    .label("app.kubernetes.io/part-of", "metaflow")
                     .annotations(
-                        {**annotations, **{"metaflow/run_id": "argo-{{workflow.name}}"}}
+                        {
+                            **annotations,
+                            **self._base_annotations,
+                            **{"metaflow/run_id": "argo-{{workflow.name}}"},
+                        }
                     )
                     # TODO: Set dynamic labels using labels_from. Ideally, we would
                     #       want to expose run_id as a label. It's easy to add labels,
@@ -749,13 +851,26 @@ class ArgoWorkflows(object):
                 # Set common pod metadata.
                 .pod_metadata(
                     Metadata()
+                    .labels(self._base_labels)
                     .label("app.kubernetes.io/name", "metaflow-task")
-                    .label("app.kubernetes.io/part-of", "metaflow")
-                    .annotations(annotations)
-                    .labels(self.kubernetes_labels)
+                    .annotations(
+                        {
+                            **annotations,
+                            **self._base_annotations,
+                            **{
+                                "metaflow/run_id": "argo-{{workflow.name}}"
+                            },  # we want pods of the workflow to have the run_id as an annotation as well
+                        }
+                    )
                 )
                 # Set the entrypoint to flow name
                 .entrypoint(self.flow.name)
+                # OnExit hooks
+                .onExit(
+                    "capture-error-hook-fn-preflight"
+                    if self.enable_error_msg_capture
+                    else None
+                )
                 # Set exit hook handlers if notifications are enabled
                 .hooks(
                     {
@@ -778,6 +893,17 @@ class ArgoWorkflows(object):
                             }
                             if self.notify_on_success
                             and self.notify_pager_duty_integration_key
+                            else {}
+                        ),
+                        **(
+                            {
+                                # workflow status maps to Completed
+                                "notify-incident-io-on-success": LifecycleHook()
+                                .expression("workflow.status == 'Succeeded'")
+                                .template("notify-incident-io-on-success"),
+                            }
+                            if self.notify_on_success
+                            and self.notify_incident_io_api_key
                             else {}
                         ),
                         **(
@@ -807,6 +933,19 @@ class ArgoWorkflows(object):
                             and self.notify_pager_duty_integration_key
                             else {}
                         ),
+                        **(
+                            {
+                                # workflow status maps to Failed or Error
+                                "notify-incident-io-on-failure": LifecycleHook()
+                                .expression("workflow.status == 'Failed'")
+                                .template("notify-incident-io-on-error"),
+                                "notify-incident-io-on-error": LifecycleHook()
+                                .expression("workflow.status == 'Error'")
+                                .template("notify-incident-io-on-error"),
+                            }
+                            if self.notify_on_error and self.notify_incident_io_api_key
+                            else {}
+                        ),
                         # Warning: terrible hack to workaround a bug in Argo Workflow
                         #          where the hooks listed above do not execute unless
                         #          there is an explicit exit hook. as and when this
@@ -825,12 +964,21 @@ class ArgoWorkflows(object):
                 .templates(self._container_templates())
                 # Exit hook template(s)
                 .templates(self._exit_hook_templates())
+                # Sidecar templates (Daemon Containers)
+                .templates(self._daemon_templates())
             )
         )
 
     # Visit every node and yield the uber DAGTemplate(s).
     def _dag_templates(self):
-        def _visit(node, exit_node=None, templates=None, dag_tasks=None):
+        def _visit(
+            node,
+            exit_node=None,
+            templates=None,
+            dag_tasks=None,
+            parent_foreach=None,
+        ):  # Returns Tuple[List[Template], List[DAGTask]]
+            """ """
             # Every for-each node results in a separate subDAG and an equivalent
             # DAGTemplate rooted at the child of the for-each node. Each DAGTemplate
             # has a unique name - the top-level DAGTemplate is named as the name of
@@ -844,7 +992,6 @@ class ArgoWorkflows(object):
                 templates = []
             if exit_node is not None and exit_node is node.name:
                 return templates, dag_tasks
-
             if node.name == "start":
                 # Start node has no dependencies.
                 dag_task = DAGTask(self._sanitize(node.name)).template(
@@ -853,13 +1000,86 @@ class ArgoWorkflows(object):
             elif (
                 node.is_inside_foreach
                 and self.graph[node.in_funcs[0]].type == "foreach"
+                and not self.graph[node.in_funcs[0]].parallel_foreach
+                # We need to distinguish what is a "regular" foreach (i.e something that doesn't care about to gang semantics)
+                # vs what is a "num_parallel" based foreach (i.e. something that follows gang semantics.)
+                # A `regular` foreach is basically any arbitrary kind of foreach.
             ):
                 # Child of a foreach node needs input-paths as well as split-index
                 # This child is the first node of the sub workflow and has no dependency
+
                 parameters = [
                     Parameter("input-paths").value("{{inputs.parameters.input-paths}}"),
                     Parameter("split-index").value("{{inputs.parameters.split-index}}"),
                 ]
+                dag_task = (
+                    DAGTask(self._sanitize(node.name))
+                    .template(self._sanitize(node.name))
+                    .arguments(Arguments().parameters(parameters))
+                )
+            elif node.parallel_step:
+                # This is the step where the @parallel decorator is defined.
+                # Since this DAGTask will call the for the `resource` [based templates]
+                # (https://argo-workflows.readthedocs.io/en/stable/walk-through/kubernetes-resources/)
+                # we have certain constraints on the way we can pass information inside the Jobset manifest
+                # [All templates will have access](https://argo-workflows.readthedocs.io/en/stable/variables/#all-templates)
+                # to the `inputs.parameters` so we will pass down ANY/ALL information using the
+                # input parameters.
+                # We define the usual parameters like input-paths/split-index etc. but we will also
+                # define the following:
+                # - `workerCount`:  parameter which will be used to determine the number of
+                #                   parallel worker jobs
+                # - `jobset-name`:  parameter which will be used to determine the name of the jobset.
+                #                   This parameter needs to be dynamic so that when we have retries we don't
+                #                   end up using the name of the jobset again (if we do, it will crash since k8s wont allow duplicated job names)
+                # - `retryCount`:   parameter which will be used to determine the number of retries
+                #                   This parameter will *only* be available within the container templates like we
+                #                   have it for all other DAGTasks and NOT for custom kubernetes resource templates.
+                #                   So as a work-around, we will set it as the `retryCount` parameter instead of
+                #                   setting it as a {{ retries }} in the CLI code. Once set as a input parameter,
+                #                   we can use it in the Jobset Manifest templates as `{{inputs.parameters.retryCount}}`
+                # - `task-id-entropy`: This is a parameter which will help derive task-ids and jobset names. This parameter
+                #                   contains the relevant amount of entropy to ensure that task-ids and jobset names
+                #                   are uniquish. We will also use this in the join task to construct the task-ids of
+                #                   all parallel tasks since the task-ids for parallel task are minted formulaically.
+                parameters = [
+                    Parameter("input-paths").value("{{inputs.parameters.input-paths}}"),
+                    Parameter("num-parallel").value(
+                        "{{inputs.parameters.num-parallel}}"
+                    ),
+                    Parameter("split-index").value("{{inputs.parameters.split-index}}"),
+                    Parameter("task-id-entropy").value(
+                        "{{inputs.parameters.task-id-entropy}}"
+                    ),
+                    # we cant just use hyphens with sprig.
+                    # https://github.com/argoproj/argo-workflows/issues/10567#issuecomment-1452410948
+                    Parameter("workerCount").value(
+                        "{{=sprig.int(sprig.sub(sprig.int(inputs.parameters['num-parallel']),1))}}"
+                    ),
+                ]
+                if any(d.name == "retry" for d in node.decorators):
+                    parameters.extend(
+                        [
+                            Parameter("retryCount").value("{{retries}}"),
+                            # The job-setname needs to be unique for each retry
+                            # and we cannot use the `generateName` field in the
+                            # Jobset Manifest since we need to construct the subdomain
+                            # and control pod domain name pre-hand. So we will use
+                            # the retry count to ensure that the jobset name is unique
+                            Parameter("jobset-name").value(
+                                "js-{{inputs.parameters.task-id-entropy}}{{retries}}",
+                            ),
+                        ]
+                    )
+                else:
+                    parameters.extend(
+                        [
+                            Parameter("jobset-name").value(
+                                "js-{{inputs.parameters.task-id-entropy}}",
+                            )
+                        ]
+                    )
+
                 dag_task = (
                     DAGTask(self._sanitize(node.name))
                     .template(self._sanitize(node.name))
@@ -874,10 +1094,43 @@ class ArgoWorkflows(object):
                                 "argo-{{workflow.name}}/%s/{{tasks.%s.outputs.parameters.task-id}}"
                                 % (n, self._sanitize(n))
                                 for n in node.in_funcs
-                            ]
+                            ],
+                            # NOTE: We set zlibmin to infinite because zlib compression for the Argo input-paths breaks template value substitution.
+                            zlibmin=inf,
                         )
                     )
                 ]
+                # NOTE: Due to limitations with Argo Workflows Parameter size we
+                #       can not pass arbitrarily large lists of task id's to join tasks.
+                #       Instead we ensure that task id's for foreach tasks can be
+                #       deduced deterministically and pass the relevant information to
+                #       the join task.
+                #
+                #       We need to add the split-index and root-input-path for the last
+                #       step in any foreach scope and use these to generate the task id,
+                #       as the join step uses the root and the cardinality of the
+                #       foreach scope to generate the required id's.
+                if (
+                    node.is_inside_foreach
+                    and self.graph[node.out_funcs[0]].type == "join"
+                ):
+                    if any(
+                        self.graph[parent].matching_join
+                        == self.graph[node.out_funcs[0]].name
+                        and self.graph[parent].type == "foreach"
+                        for parent in self.graph[node.out_funcs[0]].split_parents
+                    ):
+                        parameters.extend(
+                            [
+                                Parameter("split-index").value(
+                                    "{{inputs.parameters.split-index}}"
+                                ),
+                                Parameter("root-input-path").value(
+                                    "{{inputs.parameters.input-paths}}"
+                                ),
+                            ]
+                        )
+
                 dag_task = (
                     DAGTask(self._sanitize(node.name))
                     .dependencies(
@@ -886,8 +1139,8 @@ class ArgoWorkflows(object):
                     .template(self._sanitize(node.name))
                     .arguments(Arguments().parameters(parameters))
                 )
-            dag_tasks.append(dag_task)
 
+            dag_tasks.append(dag_task)
             # End the workflow if we have reached the end of the flow
             if node.type == "end":
                 return [
@@ -898,19 +1151,45 @@ class ArgoWorkflows(object):
             # For split nodes traverse all the children
             if node.type == "split":
                 for n in node.out_funcs:
-                    _visit(self.graph[n], node.matching_join, templates, dag_tasks)
+                    _visit(
+                        self.graph[n],
+                        node.matching_join,
+                        templates,
+                        dag_tasks,
+                        parent_foreach,
+                    )
                 return _visit(
-                    self.graph[node.matching_join], exit_node, templates, dag_tasks
+                    self.graph[node.matching_join],
+                    exit_node,
+                    templates,
+                    dag_tasks,
+                    parent_foreach,
                 )
             # For foreach nodes generate a new sub DAGTemplate
+            # We do this for "regular" foreaches (ie. `self.next(self.a, foreach=)`)
             elif node.type == "foreach":
                 foreach_template_name = self._sanitize(
                     "%s-foreach-%s"
                     % (
                         node.name,
-                        node.foreach_param,
+                        "parallel" if node.parallel_foreach else node.foreach_param,
+                        # Since foreach's are derived based on `self.next(self.a, foreach="<varname>")`
+                        # vs @parallel foreach are done based on `self.next(self.a, num_parallel="<some-number>")`,
+                        # we need to ensure that `foreach_template_name` suffix is appropriately set based on the kind
+                        # of foreach.
                     )
                 )
+
+                # There are two separate "DAGTask"s created for the foreach node.
+                # - The first one is a "jump-off" DAGTask where we propagate the
+                # input-paths and split-index. This thing doesn't create
+                # any actual containers and it responsible for only propagating
+                # the parameters.
+                # - The DAGTask that follows first DAGTask is the one
+                # that uses the ContainerTemplate. This DAGTask is named the same
+                # thing as the foreach node. We will leverage a similar pattern for the
+                # @parallel tasks.
+                #
                 foreach_task = (
                     DAGTask(foreach_template_name)
                     .dependencies([self._sanitize(node.name)])
@@ -924,27 +1203,76 @@ class ArgoWorkflows(object):
                                 ),
                                 Parameter("split-index").value("{{item}}"),
                             ]
+                            + (
+                                [
+                                    Parameter("root-input-path").value(
+                                        "argo-{{workflow.name}}/%s/{{tasks.%s.outputs.parameters.task-id}}"
+                                        % (node.name, self._sanitize(node.name))
+                                    ),
+                                ]
+                                if parent_foreach
+                                else []
+                            )
+                            + (
+                                # Disabiguate parameters for a regular `foreach` vs a `@parallel` foreach
+                                [
+                                    Parameter("num-parallel").value(
+                                        "{{tasks.%s.outputs.parameters.num-parallel}}"
+                                        % self._sanitize(node.name)
+                                    ),
+                                    Parameter("task-id-entropy").value(
+                                        "{{tasks.%s.outputs.parameters.task-id-entropy}}"
+                                        % self._sanitize(node.name)
+                                    ),
+                                ]
+                                if node.parallel_foreach
+                                else []
+                            )
                         )
                     )
                     .with_param(
+                        # For @parallel workloads `num-splits` will be explicitly set to one so that
+                        # we can piggyback on the current mechanism with which we leverage argo.
                         "{{tasks.%s.outputs.parameters.num-splits}}"
                         % self._sanitize(node.name)
                     )
                 )
                 dag_tasks.append(foreach_task)
                 templates, dag_tasks_1 = _visit(
-                    self.graph[node.out_funcs[0]], node.matching_join, templates, []
+                    self.graph[node.out_funcs[0]],
+                    node.matching_join,
+                    templates,
+                    [],
+                    node.name,
                 )
+
+                # How do foreach's work on Argo:
+                # Lets say you have the following dag: (start[sets `foreach="x"`]) --> (task-a [actual foreach]) --> (join) --> (end)
+                # With argo we will :
+                # (start [sets num-splits]) --> (task-a-foreach-(0,0) [dummy task]) --> (task-a) --> (join) --> (end)
+                # The (task-a-foreach-(0,0) [dummy task]) propagates the values of the `split-index` and the input paths.
+                # to the actual foreach task.
                 templates.append(
                     Template(foreach_template_name)
                     .inputs(
                         Inputs().parameters(
                             [Parameter("input-paths"), Parameter("split-index")]
+                            + ([Parameter("root-input-path")] if parent_foreach else [])
+                            + (
+                                [
+                                    Parameter("num-parallel"),
+                                    Parameter("task-id-entropy"),
+                                    # Parameter("workerCount")
+                                ]
+                                if node.parallel_foreach
+                                else []
+                            )
                         )
                     )
                     .outputs(
                         Outputs().parameters(
                             [
+                                # non @parallel tasks set task-ids as outputs
                                 Parameter("task-id").valueFrom(
                                     {
                                         "parameter": "{{tasks.%s.outputs.parameters.task-id}}"
@@ -954,25 +1282,76 @@ class ArgoWorkflows(object):
                                     }
                                 )
                             ]
+                            if not node.parallel_foreach
+                            else [
+                                # @parallel tasks set `task-id-entropy` and `num-parallel`
+                                # as outputs so task-ids can be derived in the join step.
+                                # Both of these values should be propagated from the
+                                # jobset labels.
+                                Parameter("num-parallel").valueFrom(
+                                    {
+                                        "parameter": "{{tasks.%s.outputs.parameters.num-parallel}}"
+                                        % self._sanitize(
+                                            self.graph[node.matching_join].in_funcs[0]
+                                        )
+                                    }
+                                ),
+                                Parameter("task-id-entropy").valueFrom(
+                                    {
+                                        "parameter": "{{tasks.%s.outputs.parameters.task-id-entropy}}"
+                                        % self._sanitize(
+                                            self.graph[node.matching_join].in_funcs[0]
+                                        )
+                                    }
+                                ),
+                            ]
                         )
                     )
                     .dag(DAGTemplate().fail_fast().tasks(dag_tasks_1))
                 )
+
                 join_foreach_task = (
                     DAGTask(self._sanitize(self.graph[node.matching_join].name))
                     .template(self._sanitize(self.graph[node.matching_join].name))
                     .dependencies([foreach_template_name])
                     .arguments(
                         Arguments().parameters(
-                            [
-                                Parameter("input-paths").value(
-                                    "argo-{{workflow.name}}/%s/{{tasks.%s.outputs.parameters}}"
-                                    % (
-                                        self.graph[node.matching_join].in_funcs[-1],
-                                        foreach_template_name,
-                                    )
-                                )
-                            ]
+                            (
+                                [
+                                    Parameter("input-paths").value(
+                                        "argo-{{workflow.name}}/%s/{{tasks.%s.outputs.parameters.task-id}}"
+                                        % (node.name, self._sanitize(node.name))
+                                    ),
+                                    Parameter("split-cardinality").value(
+                                        "{{tasks.%s.outputs.parameters.split-cardinality}}"
+                                        % self._sanitize(node.name)
+                                    ),
+                                ]
+                                if not node.parallel_foreach
+                                else [
+                                    Parameter("num-parallel").value(
+                                        "{{tasks.%s.outputs.parameters.num-parallel}}"
+                                        % self._sanitize(node.name)
+                                    ),
+                                    Parameter("task-id-entropy").value(
+                                        "{{tasks.%s.outputs.parameters.task-id-entropy}}"
+                                        % self._sanitize(node.name)
+                                    ),
+                                ]
+                            )
+                            + (
+                                [
+                                    Parameter("split-index").value(
+                                        # TODO : Pass down these parameters to the jobset stuff.
+                                        "{{inputs.parameters.split-index}}"
+                                    ),
+                                    Parameter("root-input-path").value(
+                                        "{{inputs.parameters.input-paths}}"
+                                    ),
+                                ]
+                                if parent_foreach
+                                else []
+                            )
                         )
                     )
                 )
@@ -982,11 +1361,16 @@ class ArgoWorkflows(object):
                     exit_node,
                     templates,
                     dag_tasks,
+                    parent_foreach,
                 )
             # For linear nodes continue traversing to the next node
             if node.type in ("linear", "join", "start"):
                 return _visit(
-                    self.graph[node.out_funcs[0]], exit_node, templates, dag_tasks
+                    self.graph[node.out_funcs[0]],
+                    exit_node,
+                    templates,
+                    dag_tasks,
+                    parent_foreach,
                 )
             else:
                 raise ArgoWorkflowsException(
@@ -994,7 +1378,13 @@ class ArgoWorkflows(object):
                     "Argo Workflows." % (node.type, node.name)
                 )
 
-        templates, _ = _visit(node=self.graph["start"])
+        # Generate daemon tasks
+        daemon_tasks = [
+            DAGTask("%s-task" % daemon_template.name).template(daemon_template.name)
+            for daemon_template in self._daemon_templates()
+        ]
+
+        templates, _ = _visit(node=self.graph["start"], dag_tasks=daemon_tasks)
         return templates
 
     # Visit every node and yield ContainerTemplates.
@@ -1029,17 +1419,69 @@ class ArgoWorkflows(object):
             # Ideally, we would like these task ids to be the same as node name
             # (modulo retry suffix) on Argo Workflows but that doesn't seem feasible
             # right now.
-            task_str = node.name + "-{{workflow.creationTimestamp}}"
-            if node.name != "start":
-                task_str += "-{{inputs.parameters.input-paths}}"
+
+            task_idx = ""
+            input_paths = ""
+            root_input = None
+            # export input_paths as it is used multiple times in the container script
+            # and we do not want to repeat the values.
+            input_paths_expr = "export INPUT_PATHS=''"
+            # If node is not a start step or a @parallel join then we will set the input paths.
+            # To set the input-paths as a parameter, we need to ensure that the node
+            # is not (a start node or a parallel join node). Start nodes will have no
+            # input paths and parallel join will derive input paths based on a
+            # formulaic approach using `num-parallel` and `task-id-entropy`.
+            if not (
+                node.name == "start"
+                or (node.type == "join" and self.graph[node.in_funcs[0]].parallel_step)
+            ):
+                # For parallel joins we don't pass the INPUT_PATHS but are dynamically constructed.
+                # So we don't need to set the input paths.
+                input_paths_expr = (
+                    "export INPUT_PATHS={{inputs.parameters.input-paths}}"
+                )
+                input_paths = "$(echo $INPUT_PATHS)"
             if any(self.graph[n].type == "foreach" for n in node.in_funcs):
-                task_str += "-{{inputs.parameters.split-index}}"
-            # Generated task_ids need to be non-numeric - see register_task_id in
-            # service.py. We do so by prefixing `t-`
-            task_id_expr = (
-                "export METAFLOW_TASK_ID="
-                "(t-$(echo %s | md5sum | cut -d ' ' -f 1 | tail -c 9))" % task_str
+                task_idx = "{{inputs.parameters.split-index}}"
+            if node.is_inside_foreach and self.graph[node.out_funcs[0]].type == "join":
+                if any(
+                    self.graph[parent].matching_join
+                    == self.graph[node.out_funcs[0]].name
+                    for parent in self.graph[node.out_funcs[0]].split_parents
+                    if self.graph[parent].type == "foreach"
+                ) and any(not self.graph[f].type == "foreach" for f in node.in_funcs):
+                    # we need to propagate the split-index and root-input-path info for
+                    # the last step inside a foreach for correctly joining nested
+                    # foreaches
+                    task_idx = "{{inputs.parameters.split-index}}"
+                    root_input = "{{inputs.parameters.root-input-path}}"
+
+            # Task string to be hashed into an ID
+            task_str = "-".join(
+                [
+                    node.name,
+                    "{{workflow.creationTimestamp}}",
+                    root_input or input_paths,
+                    task_idx,
+                ]
             )
+            if node.parallel_step:
+                task_str = "-".join(
+                    [
+                        "$TASK_ID_PREFIX",
+                        "{{inputs.parameters.task-id-entropy}}",
+                        "$TASK_ID_SUFFIX",
+                    ]
+                )
+            else:
+                # Generated task_ids need to be non-numeric - see register_task_id in
+                # service.py. We do so by prefixing `t-`
+                _task_id_base = (
+                    "$(echo %s | md5sum | cut -d ' ' -f 1 | tail -c 9)" % task_str
+                )
+                task_str = "(t-%s)" % _task_id_base
+
+            task_id_expr = "export METAFLOW_TASK_ID=" "%s" % task_str
             task_id = "$METAFLOW_TASK_ID"
 
             # Resolve retry strategy.
@@ -1058,9 +1500,18 @@ class ArgoWorkflows(object):
             user_code_retries = max_user_code_retries
             total_retries = max_user_code_retries + max_error_retries
             # {{retries}} is only available if retryStrategy is specified
+            # For custom kubernetes manifests, we will pass the retryCount as a parameter
+            # and use that in the manifest.
             retry_count = (
-                "{{retries}}" if max_user_code_retries + max_error_retries else 0
+                (
+                    "{{retries}}"
+                    if not node.parallel_step
+                    else "{{inputs.parameters.retryCount}}"
+                )
+                if total_retries
+                else 0
             )
+
             minutes_between_retries = int(minutes_between_retries)
 
             # Configure log capture.
@@ -1082,6 +1533,7 @@ class ArgoWorkflows(object):
                     # env var.
                     '${METAFLOW_INIT_SCRIPT:+eval \\"${METAFLOW_INIT_SCRIPT}\\"}',
                     "mkdir -p $PWD/.logs",
+                    input_paths_expr,
                     task_id_expr,
                     mflog_expr,
                 ]
@@ -1093,8 +1545,6 @@ class ArgoWorkflows(object):
                 node.name, self.flow_datastore.TYPE
             )
 
-            input_paths = "{{inputs.parameters.input-paths}}"
-
             top_opts_dict = {
                 "with": [
                     decorator.make_decorator_spec()
@@ -1105,7 +1555,7 @@ class ArgoWorkflows(object):
             # FlowDecorators can define their own top-level options. They are
             # responsible for adding their own top-level options and values through
             # the get_top_level_options() hook. See similar logic in runtime.py.
-            for deco in flow_decorators():
+            for deco in flow_decorators(self.flow):
                 top_opts_dict.update(deco.get_top_level_options())
 
             top_level = list(dict_to_cli_options(top_opts_dict)) + [
@@ -1137,7 +1587,11 @@ class ArgoWorkflows(object):
                         # {{foo.bar['param_name']}}.
                         # https://argoproj.github.io/argo-events/tutorials/02-parameterization/
                         # http://masterminds.github.io/sprig/strings.html
-                        "--%s={{workflow.parameters.%s}}"
+                        (
+                            "--%s='{{workflow.parameters.%s}}'"
+                            if parameter["type"] == "JSON"
+                            else "--%s={{workflow.parameters.%s}}"
+                        )
                         % (parameter["name"], parameter["name"])
                         for parameter in self.parameters.values()
                     ]
@@ -1163,11 +1617,27 @@ class ArgoWorkflows(object):
                 node.type == "join"
                 and self.graph[node.split_parents[-1]].type == "foreach"
             ):
-                # Set aggregated input-paths for a foreach-join
-                input_paths = (
-                    "$(python -m metaflow.plugins.argo.process_input_paths %s)"
-                    % input_paths
+                # Set aggregated input-paths for a for-each join
+                foreach_step = next(
+                    n for n in node.in_funcs if self.graph[n].is_inside_foreach
                 )
+                if not self.graph[node.split_parents[-1]].parallel_foreach:
+                    input_paths = (
+                        "$(python -m metaflow.plugins.argo.generate_input_paths %s {{workflow.creationTimestamp}} %s {{inputs.parameters.split-cardinality}})"
+                        % (
+                            foreach_step,
+                            input_paths,
+                        )
+                    )
+                else:
+                    # Handle @parallel where output from volume mount isn't accessible
+                    input_paths = (
+                        "$(python -m metaflow.plugins.argo.jobset_input_paths %s %s {{inputs.parameters.task-id-entropy}} {{inputs.parameters.num-parallel}})"
+                        % (
+                            run_id,
+                            foreach_step,
+                        )
+                    )
             step = [
                 "step",
                 node.name,
@@ -1177,7 +1647,14 @@ class ArgoWorkflows(object):
                 "--max-user-code-retries %d" % user_code_retries,
                 "--input-paths %s" % input_paths,
             ]
-            if any(self.graph[n].type == "foreach" for n in node.in_funcs):
+            if node.parallel_step:
+                step.append(
+                    "--split-index ${MF_CONTROL_INDEX:-$((MF_WORKER_REPLICA_INDEX + 1))}"
+                )
+                # This is needed for setting the value of the UBF context in the CLI.
+                step.append("--ubf-context $UBF_CONTEXT")
+
+            elif any(self.graph[n].type == "foreach" for n in node.in_funcs):
                 # Pass split-index to a foreach task
                 step.append("--split-index {{inputs.parameters.split-index}}")
             if self.tags:
@@ -1271,6 +1748,7 @@ class ArgoWorkflows(object):
                     },
                     **{
                         # Some optional values for bookkeeping
+                        "METAFLOW_FLOW_FILENAME": os.path.basename(sys.argv[0]),
                         "METAFLOW_FLOW_NAME": self.flow.name,
                         "METAFLOW_STEP_NAME": node.name,
                         "METAFLOW_RUN_ID": run_id,
@@ -1289,19 +1767,30 @@ class ArgoWorkflows(object):
 
             # support Metaflow sandboxes
             env["METAFLOW_INIT_SCRIPT"] = KUBERNETES_SANDBOX_INIT_SCRIPT
+            env["METAFLOW_KUBERNETES_SANDBOX_INIT_SCRIPT"] = (
+                KUBERNETES_SANDBOX_INIT_SCRIPT
+            )
 
             # support for @secret
             env["METAFLOW_DEFAULT_SECRETS_BACKEND_TYPE"] = DEFAULT_SECRETS_BACKEND_TYPE
-            env[
-                "METAFLOW_AWS_SECRETS_MANAGER_DEFAULT_REGION"
-            ] = AWS_SECRETS_MANAGER_DEFAULT_REGION
+            env["METAFLOW_AWS_SECRETS_MANAGER_DEFAULT_REGION"] = (
+                AWS_SECRETS_MANAGER_DEFAULT_REGION
+            )
+            env["METAFLOW_GCP_SECRET_MANAGER_PREFIX"] = GCP_SECRET_MANAGER_PREFIX
+            env["METAFLOW_AZURE_KEY_VAULT_PREFIX"] = AZURE_KEY_VAULT_PREFIX
 
             # support for Azure
-            env[
-                "METAFLOW_AZURE_STORAGE_BLOB_SERVICE_ENDPOINT"
-            ] = AZURE_STORAGE_BLOB_SERVICE_ENDPOINT
+            env["METAFLOW_AZURE_STORAGE_BLOB_SERVICE_ENDPOINT"] = (
+                AZURE_STORAGE_BLOB_SERVICE_ENDPOINT
+            )
             env["METAFLOW_DATASTORE_SYSROOT_AZURE"] = DATASTORE_SYSROOT_AZURE
             env["METAFLOW_CARD_AZUREROOT"] = CARD_AZUREROOT
+            env["METAFLOW_ARGO_WORKFLOWS_KUBERNETES_SECRETS"] = (
+                ARGO_WORKFLOWS_KUBERNETES_SECRETS
+            )
+            env["METAFLOW_ARGO_WORKFLOWS_ENV_VARS_TO_SKIP"] = (
+                ARGO_WORKFLOWS_ENV_VARS_TO_SKIP
+            )
 
             # support for GCP
             env["METAFLOW_DATASTORE_SYSROOT_GS"] = DATASTORE_SYSROOT_GS
@@ -1324,6 +1813,13 @@ class ArgoWorkflows(object):
             metaflow_version["production_token"] = self.production_token
             env["METAFLOW_VERSION"] = json.dumps(metaflow_version)
 
+            # map config values
+            cfg_env = {
+                param["name"]: param["kv_name"] for param in self.config_parameters
+            }
+            if cfg_env:
+                env["METAFLOW_FLOW_CONFIG_VALUE"] = json.dumps(cfg_env)
+
             # Set the template inputs and outputs for passing state. Very simply,
             # the container template takes in input-paths as input and outputs
             # the task-id (which feeds in as input-paths to the subsequent task).
@@ -1332,22 +1828,94 @@ class ArgoWorkflows(object):
             # input. Analogously, if the node under consideration is a foreach
             # node, then we emit split cardinality as an extra output. I would like
             # to thank the designers of Argo Workflows for making this so
-            # straightforward!
+            # straightforward! Things become a bit more complicated to support very
+            # wide foreaches where we have to resort to passing a root-input-path
+            # so that we can compute the task ids for each parent task of a for-each
+            # join task deterministically inside the join task without resorting to
+            # passing a rather long list of (albiet compressed)
             inputs = []
-            if node.name != "start":
+            # To set the input-paths as a parameter, we need to ensure that the node
+            # is not (a start node or a parallel join node). Start nodes will have no
+            # input paths and parallel join will derive input paths based on a
+            # formulaic approach.
+            if not (
+                node.name == "start"
+                or (node.type == "join" and self.graph[node.in_funcs[0]].parallel_step)
+            ):
                 inputs.append(Parameter("input-paths"))
             if any(self.graph[n].type == "foreach" for n in node.in_funcs):
                 # Fetch split-index from parent
                 inputs.append(Parameter("split-index"))
 
+            if (
+                node.type == "join"
+                and self.graph[node.split_parents[-1]].type == "foreach"
+            ):
+                # @parallel join tasks require `num-parallel` and `task-id-entropy`
+                # to construct the input paths, so we pass them down as input parameters.
+                if self.graph[node.split_parents[-1]].parallel_foreach:
+                    inputs.extend(
+                        [Parameter("num-parallel"), Parameter("task-id-entropy")]
+                    )
+                else:
+                    # append this only for joins of foreaches, not static splits
+                    inputs.append(Parameter("split-cardinality"))
+            # check if the node is a @parallel node.
+            elif node.parallel_step:
+                inputs.extend(
+                    [
+                        Parameter("num-parallel"),
+                        Parameter("task-id-entropy"),
+                        Parameter("jobset-name"),
+                        Parameter("workerCount"),
+                    ]
+                )
+                if any(d.name == "retry" for d in node.decorators):
+                    inputs.append(Parameter("retryCount"))
+
+            if node.is_inside_foreach and self.graph[node.out_funcs[0]].type == "join":
+                if any(
+                    self.graph[parent].matching_join
+                    == self.graph[node.out_funcs[0]].name
+                    for parent in self.graph[node.out_funcs[0]].split_parents
+                    if self.graph[parent].type == "foreach"
+                ) and any(not self.graph[f].type == "foreach" for f in node.in_funcs):
+                    # we need to propagate the split-index and root-input-path info for
+                    # the last step inside a foreach for correctly joining nested
+                    # foreaches
+                    if not any(self.graph[n].type == "foreach" for n in node.in_funcs):
+                        # Don't add duplicate split index parameters.
+                        inputs.append(Parameter("split-index"))
+                    inputs.append(Parameter("root-input-path"))
+
             outputs = []
-            if node.name != "end":
+            # @parallel steps will not have a task-id as an output parameter since task-ids
+            # are derived at runtime.
+            if not (node.name == "end" or node.parallel_step):
                 outputs = [Parameter("task-id").valueFrom({"path": "/mnt/out/task_id"})]
             if node.type == "foreach":
                 # Emit split cardinality from foreach task
                 outputs.append(
                     Parameter("num-splits").valueFrom({"path": "/mnt/out/splits"})
                 )
+                outputs.append(
+                    Parameter("split-cardinality").valueFrom(
+                        {"path": "/mnt/out/split_cardinality"}
+                    )
+                )
+
+            if node.parallel_foreach:
+                outputs.extend(
+                    [
+                        Parameter("num-parallel").valueFrom(
+                            {"path": "/mnt/out/num_parallel"}
+                        ),
+                        Parameter("task-id-entropy").valueFrom(
+                            {"path": "/mnt/out/task_id_entropy"}
+                        ),
+                    ]
+                )
+            # Outputs should be defined over here and not in the _dag_template for @parallel.
 
             # It makes no sense to set env vars to None (shows up as "None" string)
             # Also we skip some env vars (e.g. in case we want to pull them from KUBERNETES_SECRETS)
@@ -1363,171 +1931,384 @@ class ArgoWorkflows(object):
             tmpfs_size = resources["tmpfs_size"]
             tmpfs_path = resources["tmpfs_path"]
             tmpfs_tempdir = resources["tmpfs_tempdir"]
+            # Set shared_memory to 0 if it isn't specified. This results
+            # in Kubernetes using it's default value when the pod is created.
+            shared_memory = resources.get("shared_memory", 0)
+            port = resources.get("port", None)
+            if port:
+                port = int(port)
 
             tmpfs_enabled = use_tmpfs or (tmpfs_size and not use_tmpfs)
 
             if tmpfs_enabled and tmpfs_tempdir:
                 env["METAFLOW_TEMPDIR"] = tmpfs_path
 
+            qos_requests, qos_limits = qos_requests_and_limits(
+                resources["qos"],
+                resources["cpu"],
+                resources["memory"],
+                resources["disk"],
+            )
+
             # Create a ContainerTemplate for this node. Ideally, we would have
             # liked to inline this ContainerTemplate and avoid scanning the workflow
             # twice, but due to issues with variable substitution, we will have to
             # live with this routine.
-            yield (
-                Template(self._sanitize(node.name))
-                # Set @timeout values
-                .active_deadline_seconds(run_time_limit)
-                # Set service account
-                .service_account_name(resources["service_account"])
-                # Configure template input
-                .inputs(Inputs().parameters(inputs))
-                # Configure template output
-                .outputs(Outputs().parameters(outputs))
-                # Fail fast!
-                .fail_fast()
-                # Set @retry/@catch values
-                .retry_strategy(
-                    times=total_retries,
-                    minutes_between_retries=minutes_between_retries,
-                )
-                .metadata(
-                    ObjectMeta().annotation("metaflow/step_name", node.name)
-                    # Unfortunately, we can't set the task_id since it is generated
-                    # inside the pod. However, it can be inferred from the annotation
-                    # set by argo-workflows - `workflows.argoproj.io/outputs` - refer
-                    # the field 'task-id' in 'parameters'
-                    # .annotation("metaflow/task_id", ...)
-                    .annotation("metaflow/attempt", retry_count)
-                )
-                # Set emptyDir volume for state management
-                .empty_dir_volume("out")
-                # Set tmpfs emptyDir volume if enabled
-                .empty_dir_volume(
-                    "tmpfs-ephemeral-volume",
-                    medium="Memory",
-                    size_limit=tmpfs_size if tmpfs_enabled else 0,
-                )
-                .pvc_volumes(resources.get("persistent_volume_claims"))
-                # Set node selectors
-                .node_selectors(resources.get("node_selector"))
-                # Set tolerations
-                .tolerations(resources.get("tolerations"))
-                # Set container
-                .container(
-                    # TODO: Unify the logic with kubernetes.py
-                    # Important note - Unfortunately, V1Container uses snakecase while
-                    # Argo Workflows uses camel. For most of the attributes, both cases
-                    # are indistinguishable, but unfortunately, not for all - (
-                    # env_from, value_from, etc.) - so we need to handle the conversion
-                    # ourselves using to_camelcase. We need to be vigilant about
-                    # resources attributes in particular where the keys maybe user
-                    # defined.
-                    to_camelcase(
-                        kubernetes_sdk.V1Container(
-                            name=self._sanitize(node.name),
-                            command=cmds,
-                            env=[
-                                kubernetes_sdk.V1EnvVar(name=k, value=str(v))
-                                for k, v in env.items()
-                            ]
-                            # Add environment variables for book-keeping.
-                            # https://argoproj.github.io/argo-workflows/fields/#fields_155
-                            + [
-                                kubernetes_sdk.V1EnvVar(
-                                    name=k,
-                                    value_from=kubernetes_sdk.V1EnvVarSource(
-                                        field_ref=kubernetes_sdk.V1ObjectFieldSelector(
-                                            field_path=str(v)
-                                        )
-                                    ),
-                                )
-                                for k, v in {
-                                    "METAFLOW_KUBERNETES_POD_NAMESPACE": "metadata.namespace",
-                                    "METAFLOW_KUBERNETES_POD_NAME": "metadata.name",
-                                    "METAFLOW_KUBERNETES_POD_ID": "metadata.uid",
-                                    "METAFLOW_KUBERNETES_SERVICE_ACCOUNT_NAME": "spec.serviceAccountName",
-                                    "METAFLOW_KUBERNETES_NODE_IP": "status.hostIP",
-                                }.items()
-                            ],
-                            image=resources["image"],
-                            image_pull_policy=resources["image_pull_policy"],
-                            resources=kubernetes_sdk.V1ResourceRequirements(
-                                requests={
-                                    "cpu": str(resources["cpu"]),
-                                    "memory": "%sM" % str(resources["memory"]),
-                                    "ephemeral-storage": "%sM" % str(resources["disk"]),
-                                },
-                                limits={
-                                    "%s.com/gpu".lower()
-                                    % resources["gpu_vendor"]: str(resources["gpu"])
-                                    for k in [0]
-                                    if resources["gpu"] is not None
-                                },
-                            ),
-                            # Configure secrets
-                            env_from=[
-                                kubernetes_sdk.V1EnvFromSource(
-                                    secret_ref=kubernetes_sdk.V1SecretEnvSource(
-                                        name=str(k),
-                                        # optional=True
-                                    )
-                                )
-                                for k in list(
+            if node.parallel_step:
+                jobset_name = "{{inputs.parameters.jobset-name}}"
+                jobset = KubernetesArgoJobSet(
+                    kubernetes_sdk=kubernetes_sdk,
+                    name=jobset_name,
+                    flow_name=self.flow.name,
+                    run_id=run_id,
+                    step_name=self._sanitize(node.name),
+                    task_id=task_id,
+                    attempt=retry_count,
+                    user=self.username,
+                    subdomain=jobset_name,
+                    command=cmds,
+                    namespace=resources["namespace"],
+                    image=resources["image"],
+                    image_pull_policy=resources["image_pull_policy"],
+                    service_account=resources["service_account"],
+                    secrets=(
+                        [
+                            k
+                            for k in (
+                                list(
                                     []
                                     if not resources.get("secrets")
-                                    else [resources.get("secrets")]
-                                    if isinstance(resources.get("secrets"), str)
-                                    else resources.get("secrets")
+                                    else (
+                                        [resources.get("secrets")]
+                                        if isinstance(resources.get("secrets"), str)
+                                        else resources.get("secrets")
+                                    )
                                 )
                                 + KUBERNETES_SECRETS.split(",")
                                 + ARGO_WORKFLOWS_KUBERNETES_SECRETS.split(",")
-                                if k
-                            ],
-                            volume_mounts=[
-                                # Assign a volume mount to pass state to the next task.
-                                kubernetes_sdk.V1VolumeMount(
-                                    name="out", mount_path="/mnt/out"
-                                )
-                            ]
-                            # Support tmpfs.
-                            + (
-                                [
-                                    kubernetes_sdk.V1VolumeMount(
-                                        name="tmpfs-ephemeral-volume",
-                                        mount_path=tmpfs_path,
-                                    )
-                                ]
-                                if tmpfs_enabled
-                                else []
                             )
-                            # Support persistent volume claims.
-                            + (
-                                [
-                                    kubernetes_sdk.V1VolumeMount(
-                                        name=claim, mount_path=path
-                                    )
-                                    for claim, path in resources.get(
-                                        "persistent_volume_claims"
-                                    ).items()
-                                ]
-                                if resources.get("persistent_volume_claims") is not None
-                                else []
-                            ),
-                        ).to_dict()
+                            if k
+                        ]
+                    ),
+                    node_selector=resources.get("node_selector"),
+                    cpu=str(resources["cpu"]),
+                    memory=str(resources["memory"]),
+                    disk=str(resources["disk"]),
+                    gpu=resources["gpu"],
+                    gpu_vendor=str(resources["gpu_vendor"]),
+                    tolerations=resources["tolerations"],
+                    use_tmpfs=use_tmpfs,
+                    tmpfs_tempdir=tmpfs_tempdir,
+                    tmpfs_size=tmpfs_size,
+                    tmpfs_path=tmpfs_path,
+                    timeout_in_seconds=run_time_limit,
+                    persistent_volume_claims=resources["persistent_volume_claims"],
+                    shared_memory=shared_memory,
+                    port=port,
+                    qos=resources["qos"],
+                )
+
+                for k, v in env.items():
+                    jobset.environment_variable(k, v)
+
+                # Set labels. Do not allow user-specified task labels to override internal ones.
+                #
+                # Explicitly add the task-id-hint label. This is important because this label
+                # is returned as an Output parameter of this step and is used subsequently as an
+                # an input in the join step.
+                kubernetes_labels = {
+                    "task_id_entropy": "{{inputs.parameters.task-id-entropy}}",
+                    "num_parallel": "{{inputs.parameters.num-parallel}}",
+                    "metaflow/argo-workflows-name": "{{workflow.name}}",
+                    "workflows.argoproj.io/workflow": "{{workflow.name}}",
+                }
+                jobset.labels(
+                    {
+                        **resources["labels"],
+                        **self._base_labels,
+                        **kubernetes_labels,
+                    }
+                )
+
+                jobset.environment_variable(
+                    "MF_MASTER_ADDR", jobset.jobset_control_addr
+                )
+                jobset.environment_variable("MF_MASTER_PORT", str(port))
+                jobset.environment_variable(
+                    "MF_WORLD_SIZE", "{{inputs.parameters.num-parallel}}"
+                )
+                # We need this task-id set so that all the nodes are aware of the control
+                # task's task-id. These "MF_" variables populate the `current.parallel` namedtuple
+                jobset.environment_variable(
+                    "MF_PARALLEL_CONTROL_TASK_ID",
+                    "control-{{inputs.parameters.task-id-entropy}}-0",
+                )
+                # for k, v in .items():
+                jobset.environment_variables_from_selectors(
+                    {
+                        "MF_WORKER_REPLICA_INDEX": "metadata.annotations['jobset.sigs.k8s.io/job-index']",
+                        "JOBSET_RESTART_ATTEMPT": "metadata.annotations['jobset.sigs.k8s.io/restart-attempt']",
+                        "METAFLOW_KUBERNETES_JOBSET_NAME": "metadata.annotations['jobset.sigs.k8s.io/jobset-name']",
+                        "METAFLOW_KUBERNETES_POD_NAMESPACE": "metadata.namespace",
+                        "METAFLOW_KUBERNETES_POD_NAME": "metadata.name",
+                        "METAFLOW_KUBERNETES_POD_ID": "metadata.uid",
+                        "METAFLOW_KUBERNETES_SERVICE_ACCOUNT_NAME": "spec.serviceAccountName",
+                        "METAFLOW_KUBERNETES_NODE_IP": "status.hostIP",
+                        "TASK_ID_SUFFIX": "metadata.annotations['jobset.sigs.k8s.io/job-index']",
+                    }
+                )
+
+                # Set annotations. Do not allow user-specified task-specific annotations to override internal ones.
+                annotations = {
+                    # setting annotations explicitly as they wont be
+                    # passed down from WorkflowTemplate level
+                    "metaflow/step_name": node.name,
+                    "metaflow/attempt": str(retry_count),
+                    "metaflow/run_id": run_id,
+                }
+
+                jobset.annotations(
+                    {
+                        **resources["annotations"],
+                        **self._base_annotations,
+                        **annotations,
+                    }
+                )
+
+                jobset.control.replicas(1)
+                jobset.worker.replicas("{{=asInt(inputs.parameters.workerCount)}}")
+                jobset.control.environment_variable("UBF_CONTEXT", UBF_CONTROL)
+                jobset.worker.environment_variable("UBF_CONTEXT", UBF_TASK)
+                jobset.control.environment_variable("MF_CONTROL_INDEX", "0")
+                # `TASK_ID_PREFIX` needs to explicitly be `control` or `worker`
+                # because the join task uses a formulaic approach to infer the task-ids
+                jobset.control.environment_variable("TASK_ID_PREFIX", "control")
+                jobset.worker.environment_variable("TASK_ID_PREFIX", "worker")
+
+                yield (
+                    Template(ArgoWorkflows._sanitize(node.name))
+                    .resource(
+                        "create",
+                        jobset.dump(),
+                        "status.terminalState == Completed",
+                        "status.terminalState == Failed",
+                    )
+                    .inputs(Inputs().parameters(inputs))
+                    .outputs(
+                        Outputs().parameters(
+                            [
+                                Parameter("task-id-entropy").valueFrom(
+                                    {"jsonPath": "{.metadata.labels.task_id_entropy}"}
+                                ),
+                                Parameter("num-parallel").valueFrom(
+                                    {"jsonPath": "{.metadata.labels.num_parallel}"}
+                                ),
+                            ]
+                        )
+                    )
+                    .retry_strategy(
+                        times=total_retries,
+                        minutes_between_retries=minutes_between_retries,
                     )
                 )
-            )
+            else:
+                yield (
+                    Template(self._sanitize(node.name))
+                    # Set @timeout values
+                    .active_deadline_seconds(run_time_limit)
+                    # Set service account
+                    .service_account_name(resources["service_account"])
+                    # Configure template input
+                    .inputs(Inputs().parameters(inputs))
+                    # Configure template output
+                    .outputs(Outputs().parameters(outputs))
+                    # Fail fast!
+                    .fail_fast()
+                    # Set @retry/@catch values
+                    .retry_strategy(
+                        times=total_retries,
+                        minutes_between_retries=minutes_between_retries,
+                    )
+                    .metadata(
+                        ObjectMeta()
+                        .annotation("metaflow/step_name", node.name)
+                        # Unfortunately, we can't set the task_id since it is generated
+                        # inside the pod. However, it can be inferred from the annotation
+                        # set by argo-workflows - `workflows.argoproj.io/outputs` - refer
+                        # the field 'task-id' in 'parameters'
+                        # .annotation("metaflow/task_id", ...)
+                        .annotation("metaflow/attempt", retry_count)
+                        .annotations(resources["annotations"])
+                        .labels(resources["labels"])
+                    )
+                    # Set emptyDir volume for state management
+                    .empty_dir_volume("out")
+                    # Set tmpfs emptyDir volume if enabled
+                    .empty_dir_volume(
+                        "tmpfs-ephemeral-volume",
+                        medium="Memory",
+                        size_limit=tmpfs_size if tmpfs_enabled else 0,
+                    )
+                    .empty_dir_volume("dhsm", medium="Memory", size_limit=shared_memory)
+                    .pvc_volumes(resources.get("persistent_volume_claims"))
+                    # Set node selectors
+                    .node_selectors(resources.get("node_selector"))
+                    # Set tolerations
+                    .tolerations(resources.get("tolerations"))
+                    # Set container
+                    .container(
+                        # TODO: Unify the logic with kubernetes.py
+                        # Important note - Unfortunately, V1Container uses snakecase while
+                        # Argo Workflows uses camel. For most of the attributes, both cases
+                        # are indistinguishable, but unfortunately, not for all - (
+                        # env_from, value_from, etc.) - so we need to handle the conversion
+                        # ourselves using to_camelcase. We need to be vigilant about
+                        # resources attributes in particular where the keys maybe user
+                        # defined.
+                        to_camelcase(
+                            kubernetes_sdk.V1Container(
+                                name=self._sanitize(node.name),
+                                command=cmds,
+                                termination_message_policy="FallbackToLogsOnError",
+                                ports=(
+                                    [
+                                        kubernetes_sdk.V1ContainerPort(
+                                            container_port=port
+                                        )
+                                    ]
+                                    if port
+                                    else None
+                                ),
+                                env=[
+                                    kubernetes_sdk.V1EnvVar(name=k, value=str(v))
+                                    for k, v in env.items()
+                                ]
+                                # Add environment variables for book-keeping.
+                                # https://argoproj.github.io/argo-workflows/fields/#fields_155
+                                + [
+                                    kubernetes_sdk.V1EnvVar(
+                                        name=k,
+                                        value_from=kubernetes_sdk.V1EnvVarSource(
+                                            field_ref=kubernetes_sdk.V1ObjectFieldSelector(
+                                                field_path=str(v)
+                                            )
+                                        ),
+                                    )
+                                    for k, v in {
+                                        "METAFLOW_KUBERNETES_NAMESPACE": "metadata.namespace",
+                                        "METAFLOW_KUBERNETES_POD_NAMESPACE": "metadata.namespace",
+                                        "METAFLOW_KUBERNETES_POD_NAME": "metadata.name",
+                                        "METAFLOW_KUBERNETES_POD_ID": "metadata.uid",
+                                        "METAFLOW_KUBERNETES_SERVICE_ACCOUNT_NAME": "spec.serviceAccountName",
+                                        "METAFLOW_KUBERNETES_NODE_IP": "status.hostIP",
+                                    }.items()
+                                ],
+                                image=resources["image"],
+                                image_pull_policy=resources["image_pull_policy"],
+                                resources=kubernetes_sdk.V1ResourceRequirements(
+                                    requests=qos_requests,
+                                    limits={
+                                        **qos_limits,
+                                        **{
+                                            "%s.com/gpu".lower()
+                                            % resources["gpu_vendor"]: str(
+                                                resources["gpu"]
+                                            )
+                                            for k in [0]
+                                            if resources["gpu"] is not None
+                                        },
+                                    },
+                                ),
+                                # Configure secrets
+                                env_from=[
+                                    kubernetes_sdk.V1EnvFromSource(
+                                        secret_ref=kubernetes_sdk.V1SecretEnvSource(
+                                            name=str(k),
+                                            # optional=True
+                                        )
+                                    )
+                                    for k in list(
+                                        []
+                                        if not resources.get("secrets")
+                                        else (
+                                            [resources.get("secrets")]
+                                            if isinstance(resources.get("secrets"), str)
+                                            else resources.get("secrets")
+                                        )
+                                    )
+                                    + KUBERNETES_SECRETS.split(",")
+                                    + ARGO_WORKFLOWS_KUBERNETES_SECRETS.split(",")
+                                    if k
+                                ],
+                                volume_mounts=[
+                                    # Assign a volume mount to pass state to the next task.
+                                    kubernetes_sdk.V1VolumeMount(
+                                        name="out", mount_path="/mnt/out"
+                                    )
+                                ]
+                                # Support tmpfs.
+                                + (
+                                    [
+                                        kubernetes_sdk.V1VolumeMount(
+                                            name="tmpfs-ephemeral-volume",
+                                            mount_path=tmpfs_path,
+                                        )
+                                    ]
+                                    if tmpfs_enabled
+                                    else []
+                                )
+                                # Support shared_memory
+                                + (
+                                    [
+                                        kubernetes_sdk.V1VolumeMount(
+                                            name="dhsm",
+                                            mount_path="/dev/shm",
+                                        )
+                                    ]
+                                    if shared_memory
+                                    else []
+                                )
+                                # Support persistent volume claims.
+                                + (
+                                    [
+                                        kubernetes_sdk.V1VolumeMount(
+                                            name=claim, mount_path=path
+                                        )
+                                        for claim, path in resources.get(
+                                            "persistent_volume_claims"
+                                        ).items()
+                                    ]
+                                    if resources.get("persistent_volume_claims")
+                                    is not None
+                                    else []
+                                ),
+                            ).to_dict()
+                        )
+                    )
+                )
+
+    # Return daemon container templates for workflow execution notifications.
+    def _daemon_templates(self):
+        templates = []
+        if self.enable_heartbeat_daemon:
+            templates.append(self._heartbeat_daemon_template())
+        return templates
 
     # Return exit hook templates for workflow execution notifications.
     def _exit_hook_templates(self):
-        # TODO: Add details to slack message
         templates = []
         if self.notify_on_error:
             templates.append(self._slack_error_template())
             templates.append(self._pager_duty_alert_template())
+            templates.append(self._incident_io_alert_template())
         if self.notify_on_success:
             templates.append(self._slack_success_template())
             templates.append(self._pager_duty_change_template())
+            templates.append(self._incident_io_change_template())
+
+        # Clean up None values from templates.
+        templates = list(filter(None, templates))
+
         if self.notify_on_error or self.notify_on_success:
             # Warning: terrible hack to workaround a bug in Argo Workflow where the
             #          templates listed above do not execute unless there is an
@@ -1545,7 +2326,151 @@ class ArgoWorkflows(object):
                     .success_condition("true == true")
                 )
             )
+        if self.enable_error_msg_capture:
+            templates.extend(self._error_msg_capture_hook_templates())
         return templates
+
+    def _error_msg_capture_hook_templates(self):
+        from kubernetes import client as kubernetes_sdk
+
+        start_step = [step for step in self.graph if step.name == "start"][0]
+        # We want to grab the base image used by the start step, as this is known to be pullable from within the cluster,
+        # and it might contain the required libraries, allowing us to start up faster.
+        resources = dict(
+            [deco for deco in start_step.decorators if deco.name == "kubernetes"][
+                0
+            ].attributes
+        )
+
+        run_id_template = "argo-{{workflow.name}}"
+        metaflow_version = self.environment.get_environment_info()
+        metaflow_version["flow_name"] = self.graph.name
+        metaflow_version["production_token"] = self.production_token
+
+        mflog_expr = export_mflog_env_vars(
+            datastore_type=self.flow_datastore.TYPE,
+            stdout_path="$PWD/.logs/mflog_stdout",
+            stderr_path="$PWD/.logs/mflog_stderr",
+            flow_name=self.flow.name,
+            run_id=run_id_template,
+            step_name="_run_capture_error",
+            task_id="1",
+            retry_count="0",
+        )
+
+        cmds = " && ".join(
+            [
+                # For supporting sandboxes, ensure that a custom script is executed
+                # before anything else is executed. The script is passed in as an
+                # env var.
+                '${METAFLOW_INIT_SCRIPT:+eval \\"${METAFLOW_INIT_SCRIPT}\\"}',
+                "mkdir -p $PWD/.logs",
+                mflog_expr,
+            ]
+            + self.environment.get_package_commands(
+                self.code_package_url, self.flow_datastore.TYPE
+            )[:-1]
+            # Replace the line 'Task in starting'
+            # FIXME: this can be brittle.
+            + ["mflog 'Error capture hook is starting.'"]
+            + ["argo_error=$(python -m 'metaflow.plugins.argo.capture_error')"]
+            + ["export METAFLOW_ARGO_ERROR=$argo_error"]
+            + [
+                """python -c 'import json, os; error_obj=os.getenv(\\"METAFLOW_ARGO_ERROR\\");data=json.loads(error_obj); print(data[\\"message\\"])'"""
+            ]
+            + [
+                'if [ -n \\"${METAFLOW_ARGO_WORKFLOWS_CAPTURE_ERROR_SCRIPT}\\" ]; then eval \\"${METAFLOW_ARGO_WORKFLOWS_CAPTURE_ERROR_SCRIPT}\\"; fi'
+            ]
+        )
+
+        # TODO: Also capture the first failed task id
+        cmds = shlex.split('bash -c "%s"' % cmds)
+        env = {
+            # These values are needed by Metaflow to set it's internal
+            # state appropriately.
+            "METAFLOW_CODE_URL": self.code_package_url,
+            "METAFLOW_CODE_SHA": self.code_package_sha,
+            "METAFLOW_CODE_DS": self.flow_datastore.TYPE,
+            "METAFLOW_SERVICE_URL": SERVICE_INTERNAL_URL,
+            "METAFLOW_SERVICE_HEADERS": json.dumps(SERVICE_HEADERS),
+            "METAFLOW_USER": "argo-workflows",
+            "METAFLOW_DEFAULT_DATASTORE": self.flow_datastore.TYPE,
+            "METAFLOW_DEFAULT_METADATA": DEFAULT_METADATA,
+            "METAFLOW_OWNER": self.username,
+        }
+        # support Metaflow sandboxes
+        env["METAFLOW_INIT_SCRIPT"] = KUBERNETES_SANDBOX_INIT_SCRIPT
+        env["METAFLOW_ARGO_WORKFLOWS_CAPTURE_ERROR_SCRIPT"] = (
+            ARGO_WORKFLOWS_CAPTURE_ERROR_SCRIPT
+        )
+
+        env["METAFLOW_WORKFLOW_NAME"] = "{{workflow.name}}"
+        env["METAFLOW_WORKFLOW_NAMESPACE"] = "{{workflow.namespace}}"
+        env["METAFLOW_ARGO_WORKFLOW_FAILURES"] = "{{workflow.failures}}"
+        env = {
+            k: v
+            for k, v in env.items()
+            if v is not None
+            and k not in set(ARGO_WORKFLOWS_ENV_VARS_TO_SKIP.split(","))
+        }
+        return [
+            Template("error-msg-capture-hook")
+            .service_account_name(resources["service_account"])
+            .container(
+                to_camelcase(
+                    kubernetes_sdk.V1Container(
+                        name="main",
+                        command=cmds,
+                        image=resources["image"],
+                        env=[
+                            kubernetes_sdk.V1EnvVar(name=k, value=str(v))
+                            for k, v in env.items()
+                        ],
+                        env_from=[
+                            kubernetes_sdk.V1EnvFromSource(
+                                secret_ref=kubernetes_sdk.V1SecretEnvSource(
+                                    name=str(k),
+                                    # optional=True
+                                )
+                            )
+                            for k in list(
+                                []
+                                if not resources.get("secrets")
+                                else (
+                                    [resources.get("secrets")]
+                                    if isinstance(resources.get("secrets"), str)
+                                    else resources.get("secrets")
+                                )
+                            )
+                            + KUBERNETES_SECRETS.split(",")
+                            + ARGO_WORKFLOWS_KUBERNETES_SECRETS.split(",")
+                            if k
+                        ],
+                        resources=kubernetes_sdk.V1ResourceRequirements(
+                            # NOTE: base resources for this are kept to a minimum to save on running costs.
+                            # This has an adverse effect on startup time for the daemon, which can be completely
+                            # alleviated by using a base image that has the required dependencies pre-installed
+                            requests={
+                                "cpu": "200m",
+                                "memory": "100Mi",
+                            },
+                            limits={
+                                "cpu": "200m",
+                                "memory": "500Mi",
+                            },
+                        ),
+                    ).to_dict()
+                )
+            ),
+            Template("capture-error-hook-fn-preflight").steps(
+                [
+                    WorkflowStep()
+                    .name("capture-error-hook-fn-preflight")
+                    .template("error-msg-capture-hook")
+                    .when("{{workflow.status}} != Succeeded")
+                ]
+            ),
+        ]
 
     def _pager_duty_alert_template(self):
         # https://developer.pagerduty.com/docs/ZG9jOjExMDI5NTgx-send-an-alert-event
@@ -1576,6 +2501,82 @@ class ArgoWorkflows(object):
                 )
             )
         )
+
+    def _incident_io_alert_template(self):
+        if self.notify_incident_io_api_key is None:
+            return None
+        if self.incident_io_error_severity_id is None:
+            raise MetaflowException(
+                "Creating incidents for errors requires a severity id."
+            )
+        return Template("notify-incident-io-on-error").http(
+            Http("POST")
+            .url("https://api.incident.io/v2/incidents")
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer %s" % self.notify_incident_io_api_key)
+            .body(
+                json.dumps(
+                    {
+                        "idempotency_key": "argo-{{workflow.name}}",  # use run id to deduplicate alerts.
+                        "visibility": "public",
+                        "severity_id": self.incident_io_error_severity_id,
+                        "name": "Flow %s has failed." % self.flow.name,
+                        "summary": "Metaflow run %s/argo-{{workflow.name}} failed! %s"
+                        % (self.flow.name, self._incident_io_ui_urls_for_run()),
+                        # TODO: Add support for custom field entries.
+                    }
+                )
+            )
+        )
+
+    def _incident_io_change_template(self):
+        if self.notify_incident_io_api_key is None:
+            return None
+        if self.incident_io_success_severity_id is None:
+            raise MetaflowException(
+                "Creating incidents for successes requires a severity id."
+            )
+        return Template("notify-incident-io-on-success").http(
+            Http("POST")
+            .url("https://api.incident.io/v2/incidents")
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer %s" % self.notify_incident_io_api_key)
+            .body(
+                json.dumps(
+                    {
+                        "idempotency_key": "argo-{{workflow.name}}",  # use run id to deduplicate alerts.
+                        "visibility": "public",
+                        "severity_id": self.incident_io_success_severity_id,
+                        # TODO: Do we need to make incident type configurable for successes? otherwise they are created as 'investigating'
+                        # "incident_type_id": ""
+                        "name": "Flow %s has succeeded." % self.flow.name,
+                        "summary": "Metaflow run %s/argo-{{workflow.name}} succeeded!%s"
+                        % (self.flow.name, self._incident_io_ui_urls_for_run()),
+                        # TODO: Add support for custom field entries.
+                    }
+                )
+            )
+        )
+
+    def _incident_io_ui_urls_for_run(self):
+        links = []
+        if UI_URL:
+            url = "[Metaflow UI](%s/%s/%s)" % (
+                UI_URL.rstrip("/"),
+                self.flow.name,
+                "argo-{{workflow.name}}",
+            )
+            links.append(url)
+        if ARGO_WORKFLOWS_UI_URL:
+            url = "[Argo UI](%s/workflows/%s/%s)" % (
+                ARGO_WORKFLOWS_UI_URL.rstrip("/"),
+                "{{workflow.namespace}}",
+                "{{workflow.name}}",
+            )
+            links.append(url)
+        if links:
+            links = ["See details for the run at: ", *links]
+        return "\n\n".join(links)
 
     def _pager_duty_change_template(self):
         # https://developer.pagerduty.com/docs/ZG9jOjExMDI5NTgy-send-a-change-event
@@ -1629,35 +2630,263 @@ class ArgoWorkflows(object):
 
         return links
 
+    def _get_slack_blocks(self, message):
+        """
+        Use Slack's Block Kit to add general information about the environment and
+        execution metadata, including a link to the UI and an optional message.
+        """
+        ui_link = "%s/%s/argo-{{workflow.name}}" % (UI_URL.rstrip("/"), self.flow.name)
+        # fmt: off
+        if getattr(current, "project_name", None):
+            # Add @project metadata when available.
+            environment_details_block = {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ":metaflow: Environment details"
+                },
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": "*Project:* %s" % current.project_name
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": "*Project Branch:* %s" % current.branch_name
+                    }
+                ]
+            }
+        else:
+            environment_details_block = {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ":metaflow: Environment details"
+                }
+            }
+
+        blocks = [
+            environment_details_block,
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": " :information_source: *<%s>*" % ui_link,
+                    }
+                ],
+            },
+            {
+                "type": "divider"
+            },
+        ]
+
+        if message:
+            blocks += [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": message
+                    }
+                }
+            ]
+        # fmt: on
+        return blocks
+
     def _slack_error_template(self):
         if self.notify_slack_webhook_url is None:
             return None
+
+        message = (
+            ":rotating_light: _%s/argo-{{workflow.name}}_ failed!" % self.flow.name
+        )
+        payload = {"text": message}
+        if UI_URL:
+            blocks = self._get_slack_blocks(message)
+            payload = {"text": message, "blocks": blocks}
+
         return Template("notify-slack-on-error").http(
-            Http("POST")
-            .url(self.notify_slack_webhook_url)
-            .body(
-                json.dumps(
-                    {
-                        "text": ":rotating_light: _%s/argo-{{workflow.name}}_ failed!"
-                        % self.flow.name
-                    }
-                )
-            )
+            Http("POST").url(self.notify_slack_webhook_url).body(json.dumps(payload))
         )
 
     def _slack_success_template(self):
         if self.notify_slack_webhook_url is None:
             return None
+
+        message = (
+            ":white_check_mark: _%s/argo-{{workflow.name}}_ succeeded!" % self.flow.name
+        )
+        payload = {"text": message}
+        if UI_URL:
+            blocks = self._get_slack_blocks(message)
+            payload = {"text": message, "blocks": blocks}
+
         return Template("notify-slack-on-success").http(
-            Http("POST")
-            .url(self.notify_slack_webhook_url)
-            .body(
-                json.dumps(
-                    {
-                        "text": ":white_check_mark: _%s/argo-{{workflow.name}}_ succeeded!"
-                        % self.flow.name
-                    }
-                )
+            Http("POST").url(self.notify_slack_webhook_url).body(json.dumps(payload))
+        )
+
+    def _heartbeat_daemon_template(self):
+        # Use all the affordances available to _parameters task
+        executable = self.environment.executable("_parameters")
+        run_id = "argo-{{workflow.name}}"
+        script_name = os.path.basename(sys.argv[0])
+        entrypoint = [executable, script_name]
+        # FlowDecorators can define their own top-level options. These might affect run level information
+        # so it is important to pass these to the heartbeat process as well, as it might be the first task to register a run.
+        top_opts_dict = {}
+        for deco in flow_decorators(self.flow):
+            top_opts_dict.update(deco.get_top_level_options())
+
+        top_level = list(dict_to_cli_options(top_opts_dict)) + [
+            "--quiet",
+            "--metadata=%s" % self.metadata.TYPE,
+            "--environment=%s" % self.environment.TYPE,
+            "--datastore=%s" % self.flow_datastore.TYPE,
+            "--datastore-root=%s" % self.flow_datastore.datastore_root,
+            "--event-logger=%s" % self.event_logger.TYPE,
+            "--monitor=%s" % self.monitor.TYPE,
+            "--no-pylint",
+            "--with=argo_workflows_internal:auto-emit-argo-events=%i"
+            % self.auto_emit_argo_events,
+        ]
+        heartbeat_cmds = "{entrypoint} {top_level} argo-workflows heartbeat --run_id {run_id} {tags}".format(
+            entrypoint=" ".join(entrypoint),
+            top_level=" ".join(top_level) if top_level else "",
+            run_id=run_id,
+            tags=" ".join(["--tag %s" % t for t in self.tags]) if self.tags else "",
+        )
+
+        # TODO: we do not really need MFLOG logging for the daemon at the moment, but might be good for the future.
+        # Consider if we can do without this setup.
+        # Configure log capture.
+        mflog_expr = export_mflog_env_vars(
+            datastore_type=self.flow_datastore.TYPE,
+            stdout_path="$PWD/.logs/mflog_stdout",
+            stderr_path="$PWD/.logs/mflog_stderr",
+            flow_name=self.flow.name,
+            run_id=run_id,
+            step_name="_run_heartbeat_daemon",
+            task_id="1",
+            retry_count="0",
+        )
+        # TODO: Can the init be trimmed down?
+        # Can we do without get_package_commands fetching the whole code package?
+        init_cmds = " && ".join(
+            [
+                # For supporting sandboxes, ensure that a custom script is executed
+                # before anything else is executed. The script is passed in as an
+                # env var.
+                '${METAFLOW_INIT_SCRIPT:+eval \\"${METAFLOW_INIT_SCRIPT}\\"}',
+                "mkdir -p $PWD/.logs",
+                mflog_expr,
+            ]
+            + self.environment.get_package_commands(
+                self.code_package_url, self.flow_datastore.TYPE
+            )[:-1]
+            # Replace the line 'Task in starting'
+            # FIXME: this can be brittle.
+            + ["mflog 'Heartbeat daemon is starting.'"]
+        )
+
+        cmd_str = " && ".join([init_cmds, heartbeat_cmds])
+        cmds = shlex.split('bash -c "%s"' % cmd_str)
+
+        # Env required for sending heartbeats to the metadata service, nothing extra.
+        # prod token / runtime info is required to correctly register flow branches
+        env = {
+            # These values are needed by Metaflow to set it's internal
+            # state appropriately.
+            "METAFLOW_CODE_URL": self.code_package_url,
+            "METAFLOW_CODE_SHA": self.code_package_sha,
+            "METAFLOW_CODE_DS": self.flow_datastore.TYPE,
+            "METAFLOW_SERVICE_URL": SERVICE_INTERNAL_URL,
+            "METAFLOW_SERVICE_HEADERS": json.dumps(SERVICE_HEADERS),
+            "METAFLOW_USER": "argo-workflows",
+            "METAFLOW_DATASTORE_SYSROOT_S3": DATASTORE_SYSROOT_S3,
+            "METAFLOW_DATATOOLS_S3ROOT": DATATOOLS_S3ROOT,
+            "METAFLOW_DEFAULT_DATASTORE": self.flow_datastore.TYPE,
+            "METAFLOW_DEFAULT_METADATA": DEFAULT_METADATA,
+            "METAFLOW_CARD_S3ROOT": CARD_S3ROOT,
+            "METAFLOW_KUBERNETES_WORKLOAD": 1,
+            "METAFLOW_KUBERNETES_FETCH_EC2_METADATA": KUBERNETES_FETCH_EC2_METADATA,
+            "METAFLOW_RUNTIME_ENVIRONMENT": "kubernetes",
+            "METAFLOW_OWNER": self.username,
+            "METAFLOW_PRODUCTION_TOKEN": self.production_token,  # Used in identity resolving. This affects system tags.
+        }
+        # support Metaflow sandboxes
+        env["METAFLOW_INIT_SCRIPT"] = KUBERNETES_SANDBOX_INIT_SCRIPT
+
+        # cleanup env values
+        env = {
+            k: v
+            for k, v in env.items()
+            if v is not None
+            and k not in set(ARGO_WORKFLOWS_ENV_VARS_TO_SKIP.split(","))
+        }
+
+        # We want to grab the base image used by the start step, as this is known to be pullable from within the cluster,
+        # and it might contain the required libraries, allowing us to start up faster.
+        start_step = next(step for step in self.flow if step.name == "start")
+        resources = dict(
+            [deco for deco in start_step.decorators if deco.name == "kubernetes"][
+                0
+            ].attributes
+        )
+        from kubernetes import client as kubernetes_sdk
+
+        return (
+            DaemonTemplate("heartbeat-daemon")
+            # NOTE: Even though a retry strategy does not work for Argo daemon containers,
+            # this has the side-effect of protecting the exit hooks of the workflow from failing in case the daemon container errors out.
+            .retry_strategy(10, 1)
+            .service_account_name(resources["service_account"])
+            .container(
+                to_camelcase(
+                    kubernetes_sdk.V1Container(
+                        name="main",
+                        # TODO: Make the image configurable
+                        image=resources["image"],
+                        command=cmds,
+                        env=[
+                            kubernetes_sdk.V1EnvVar(name=k, value=str(v))
+                            for k, v in env.items()
+                        ],
+                        env_from=[
+                            kubernetes_sdk.V1EnvFromSource(
+                                secret_ref=kubernetes_sdk.V1SecretEnvSource(
+                                    name=str(k),
+                                    # optional=True
+                                )
+                            )
+                            for k in list(
+                                []
+                                if not resources.get("secrets")
+                                else (
+                                    [resources.get("secrets")]
+                                    if isinstance(resources.get("secrets"), str)
+                                    else resources.get("secrets")
+                                )
+                            )
+                            + KUBERNETES_SECRETS.split(",")
+                            + ARGO_WORKFLOWS_KUBERNETES_SECRETS.split(",")
+                            if k
+                        ],
+                        resources=kubernetes_sdk.V1ResourceRequirements(
+                            # NOTE: base resources for this are kept to a minimum to save on running costs.
+                            # This has an adverse effect on startup time for the daemon, which can be completely
+                            # alleviated by using a base image that has the required dependencies pre-installed
+                            requests={
+                                "cpu": "200m",
+                                "memory": "100Mi",
+                            },
+                            limits={
+                                "cpu": "200m",
+                                "memory": "100Mi",
+                            },
+                        ),
+                    )
+                ).to_dict()
             )
         )
 
@@ -1760,44 +2989,16 @@ class ArgoWorkflows(object):
                 "sdk (https://pypi.org/project/kubernetes/) first."
             )
 
-        labels = {"app.kubernetes.io/part-of": "metaflow"}
-
-        annotations = {
-            "metaflow/production_token": self.production_token,
-            "metaflow/owner": self.username,
-            "metaflow/user": "argo-workflows",
-            "metaflow/flow_name": self.flow.name,
-        }
-        if current.get("project_name"):
-            annotations.update(
-                {
-                    "metaflow/project_name": current.project_name,
-                    "metaflow/branch_name": current.branch_name,
-                    "metaflow/project_flow_name": current.project_flow_name,
-                }
-            )
-
-        # Useful to paint the UI
-        trigger_annotations = {
-            "metaflow/triggered_by": json.dumps(
-                [
-                    {key: trigger.get(key) for key in ["name", "type"]}
-                    for trigger in self.triggers
-                ]
-            )
-        }
-
         return (
             Sensor()
             .metadata(
                 # Sensor metadata.
                 ObjectMeta()
-                .name(self.name.replace(".", "-"))
+                .name(ArgoWorkflows._sensor_name(self.name))
                 .namespace(KUBERNETES_NAMESPACE)
+                .labels(self._base_labels)
                 .label("app.kubernetes.io/name", "metaflow-sensor")
-                .label("app.kubernetes.io/part-of", "metaflow")
-                .labels(self.kubernetes_labels)
-                .annotations(annotations)
+                .annotations(self._base_annotations)
             )
             .spec(
                 SensorSpec().template(
@@ -1807,7 +3008,7 @@ class ArgoWorkflows(object):
                         ObjectMeta()
                         .label("app.kubernetes.io/name", "metaflow-sensor")
                         .label("app.kubernetes.io/part-of", "metaflow")
-                        .annotations(annotations)
+                        .annotations(self._base_annotations)
                     )
                     .container(
                         # Run sensor in guaranteed QoS. The sensor isn't doing a lot
@@ -1827,7 +3028,7 @@ class ArgoWorkflows(object):
                                         "memory": "250Mi",
                                     },
                                 ),
-                            )
+                            ).to_dict()
                         )
                     )
                     .service_account_name(ARGO_EVENTS_SERVICE_ACCOUNT)
@@ -1854,6 +3055,7 @@ class ArgoWorkflows(object):
                                         "metadata": {
                                             "generateName": "%s-" % self.name,
                                             "namespace": KUBERNETES_NAMESPACE,
+                                            # Useful to paint the UI
                                             "annotations": {
                                                 "metaflow/triggered_by": json.dumps(
                                                     [
@@ -1900,8 +3102,11 @@ class ArgoWorkflows(object):
                                                 # Technically, we don't need to create
                                                 # a payload carry-on and can stuff
                                                 # everything within the body.
-                                                data_template="{{ .Input.body.payload.%s | toJson }}"
-                                                % v,
+                                                # NOTE: We need the conditional logic in order to successfully fall back to the default value
+                                                # when the event payload does not contain a key for a parameter.
+                                                # NOTE: Keys might contain dashes, so use the safer 'get' for fetching the value
+                                                data_template='{{ if (hasKey $.Input.body.payload "%s") }}{{- (get $.Input.body.payload "%s" | toRawJson) -}}{{- else -}}{{ (fail "use-default-instead") }}{{- end -}}'
+                                                % (v, v),
                                                 # Unfortunately the sensor needs to
                                                 # record the default values for
                                                 # the parameters - there doesn't seem
@@ -2112,6 +3317,34 @@ class ObjectMeta(object):
         return json.dumps(self.to_json(), indent=4)
 
 
+class WorkflowStep(object):
+    def __init__(self):
+        tree = lambda: defaultdict(tree)
+        self.payload = tree()
+
+    def name(self, name):
+        self.payload["name"] = str(name)
+        return self
+
+    def template(self, template):
+        self.payload["template"] = str(template)
+        return self
+
+    def when(self, condition):
+        self.payload["when"] = str(condition)
+        return self
+
+    def step(self, expression):
+        self.payload["expression"] = str(expression)
+        return self
+
+    def to_json(self):
+        return self.payload
+
+    def __str__(self):
+        return json.dumps(self.to_json(), indent=4)
+
+
 class WorkflowSpec(object):
     # https://argoproj.github.io/argo-workflows/fields/#workflowspec
     # This object sets all Workflow level properties.
@@ -2140,6 +3373,11 @@ class WorkflowSpec(object):
 
     def entrypoint(self, entrypoint):
         self.payload["entrypoint"] = entrypoint
+        return self
+
+    def onExit(self, on_exit_template):
+        if on_exit_template:
+            self.payload["onExit"] = on_exit_template
         return self
 
     def parallelism(self, parallelism):
@@ -2230,6 +3468,38 @@ class Metadata(object):
         return json.dumps(self.to_json(), indent=4)
 
 
+class DaemonTemplate(object):
+    def __init__(self, name):
+        tree = lambda: defaultdict(tree)
+        self.name = name
+        self.payload = tree()
+        self.payload["daemon"] = True
+        self.payload["name"] = name
+
+    def container(self, container):
+        self.payload["container"] = container
+        return self
+
+    def service_account_name(self, service_account_name):
+        self.payload["serviceAccountName"] = service_account_name
+        return self
+
+    def retry_strategy(self, times, minutes_between_retries):
+        if times > 0:
+            self.payload["retryStrategy"] = {
+                "retryPolicy": "Always",
+                "limit": times,
+                "backoff": {"duration": "%sm" % minutes_between_retries},
+            }
+        return self
+
+    def to_json(self):
+        return self.payload
+
+    def __str__(self):
+        return json.dumps(self.payload, indent=4)
+
+
 class Template(object):
     # https://argoproj.github.io/argo-workflows/fields/#template
 
@@ -2246,6 +3516,18 @@ class Template(object):
 
     def dag(self, dag_template):
         self.payload["dag"] = dag_template.to_json()
+        return self
+
+    def steps(self, steps):
+        if "steps" not in self.payload:
+            self.payload["steps"] = []
+        # steps is a list of lists.
+        # hence we go over every item in the incoming list
+        # serialize it and then append the list to the payload
+        step_list = []
+        for step in steps:
+            step_list.append(step.to_json())
+        self.payload["steps"].append(step_list)
         return self
 
     def container(self, container):
@@ -2353,6 +3635,15 @@ class Template(object):
 
     def to_json(self):
         return self.payload
+
+    def resource(self, action, manifest, success_criteria, failure_criteria):
+        self.payload["resource"] = {}
+        self.payload["resource"]["action"] = action
+        self.payload["resource"]["setOwnerReference"] = True
+        self.payload["resource"]["successCondition"] = success_criteria
+        self.payload["resource"]["failureCondition"] = failure_criteria
+        self.payload["resource"]["manifest"] = manifest
+        return self
 
     def __str__(self):
         return json.dumps(self.payload, indent=4)

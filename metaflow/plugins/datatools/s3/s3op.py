@@ -44,8 +44,9 @@ from metaflow.plugins.datatools.s3.s3util import (
     TRANSIENT_RETRY_START_LINE,
 )
 import metaflow.tracing as tracing
-
-NUM_WORKERS_DEFAULT = 64
+from metaflow.metaflow_config import (
+    S3_WORKER_COUNT,
+)
 
 DOWNLOAD_FILE_THRESHOLD = 2 * TransferConfig().multipart_threshold
 DOWNLOAD_MAX_CHUNK = 2 * 1024 * 1024 * 1024 - 1
@@ -154,7 +155,7 @@ def normalize_client_error(err):
 # S3 worker pool
 
 
-@tracing.cli_entrypoint("s3op/worker")
+@tracing.cli("s3op/worker")
 def worker(result_file_name, queue, mode, s3config):
     # Interpret mode, it can either be a single op or something like
     # info_download or info_upload which implies:
@@ -656,7 +657,7 @@ def common_options(func):
     )
     @click.option(
         "--num-workers",
-        default=NUM_WORKERS_DEFAULT,
+        default=S3_WORKER_COUNT,
         show_default=True,
         help="Number of concurrent connections.",
     )
@@ -721,8 +722,8 @@ def cli():
     pass
 
 
-@tracing.cli_entrypoint("s3op/list")
 @cli.command("list", help="List S3 objects")
+@tracing.cli("s3op/list")
 @click.option(
     "--recursive/--no-recursive",
     default=False,
@@ -781,8 +782,8 @@ def lst(
             print(format_result_line(idx, url.prefix, url.url, str(size)))
 
 
-@tracing.cli_entrypoint("s3op/put")
 @cli.command(help="Upload files to S3")
+@tracing.cli("s3op/put")
 @click.option(
     "--file",
     "files",
@@ -976,8 +977,8 @@ def _populate_prefixes(prefixes, inputs):
     return prefixes, is_transient_retry
 
 
-@tracing.cli_entrypoint("s3op/get")
 @cli.command(help="Download files from S3")
+@tracing.cli("s3op/get")
 @click.option(
     "--recursive/--no-recursive",
     default=False,
@@ -1118,9 +1119,11 @@ def get(
                         str(url.idx),
                         url_quote(url.prefix).decode(encoding="utf-8"),
                         url_quote(url.url).decode(encoding="utf-8"),
-                        url_quote(url.range).decode(encoding="utf-8")
-                        if url.range
-                        else "<norange>",
+                        (
+                            url_quote(url.range).decode(encoding="utf-8")
+                            if url.range
+                            else "<norange>"
+                        ),
                     ]
                 )
                 + "\n"

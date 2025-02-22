@@ -2,15 +2,17 @@ import importlib
 import json
 import os
 import platform
+import re
 import sys
 import tempfile
 
 from metaflow.decorators import FlowDecorator, StepDecorator
 from metaflow.extension_support import EXT_PKG
+from metaflow.metadata_provider import MetaDatum
 from metaflow.metaflow_environment import InvalidEnvironmentException
 from metaflow.util import get_metaflow_root
 
-from ... import INFO_FILE
+from ...info_file import INFO_FILE
 
 
 class CondaStepDecorator(StepDecorator):
@@ -24,15 +26,15 @@ class CondaStepDecorator(StepDecorator):
 
     Parameters
     ----------
-    packages : Dict[str, str], default: {}
+    packages : Dict[str, str], default {}
         Packages to use for this step. The key is the name of the package
         and the value is the version to use.
-    libraries : Dict[str, str], default: {}
+    libraries : Dict[str, str], default {}
         Supported for backward compatibility. When used with packages, packages will take precedence.
-    python : str, optional
+    python : str, optional, default None
         Version of Python to use, e.g. '3.7.4'. A default value of None implies
         that the version used will correspond to the version of the Python interpreter used to start the run.
-    disabled : bool, default: False
+    disabled : bool, default False
         If set to True, disables @conda.
     """
 
@@ -48,7 +50,14 @@ class CondaStepDecorator(StepDecorator):
     # conda channels, users can specify channel::package as the package name.
 
     def __init__(self, attributes=None, statically_defined=False):
+        self._attributes_with_user_values = (
+            set(attributes.keys()) if attributes is not None else set()
+        )
+
         super(CondaStepDecorator, self).__init__(attributes, statically_defined)
+
+    def init(self):
+        super(CondaStepDecorator, self).init()
 
         # Support legacy 'libraries=' attribute for the decorator.
         self.attributes["packages"] = {
@@ -56,6 +65,11 @@ class CondaStepDecorator(StepDecorator):
             **self.attributes["packages"],
         }
         del self.attributes["libraries"]
+        if self.attributes["packages"]:
+            self._attributes_with_user_values.add("packages")
+
+    def is_attribute_user_defined(self, name):
+        return name in self._attributes_with_user_values
 
     def step_init(self, flow, graph, step, decos, environment, flow_datastore, logger):
         # The init_environment hook for Environment creates the relevant virtual
@@ -69,11 +83,16 @@ class CondaStepDecorator(StepDecorator):
 
         # Support flow-level decorator.
         if "conda_base" in self.flow._flow_decorators:
-            super_attributes = self.flow._flow_decorators["conda_base"][0].attributes
+            conda_base = self.flow._flow_decorators["conda_base"][0]
+            super_attributes = conda_base.attributes
             self.attributes["packages"] = {
                 **super_attributes["packages"],
                 **self.attributes["packages"],
             }
+            self._attributes_with_user_values.update(
+                conda_base._attributes_with_user_values
+            )
+
             self.attributes["python"] = (
                 self.attributes["python"] or super_attributes["python"]
             )
@@ -97,6 +116,10 @@ class CondaStepDecorator(StepDecorator):
         # To placate people who don't want to see a shred of conda in UX, we symlink
         # --environment=pypi to --environment=conda
         _supported_virtual_envs.extend(["pypi"])
+
+        # TODO: Hardcoded for now to support the fast bakery environment.
+        # We should introduce a more robust mechanism for appending supported environments, for example from within extensions.
+        _supported_virtual_envs.extend(["fast-bakery"])
 
         # The --environment= requirement ensures that valid virtual environments are
         # created for every step to execute it, greatly simplifying the @conda
@@ -204,7 +227,7 @@ class CondaStepDecorator(StepDecorator):
         self.interpreter = (
             self.environment.interpreter(self.step)
             if not any(
-                decorator.name in ["batch", "kubernetes"]
+                decorator.name in ["batch", "kubernetes", "nvidia", "snowpark", "slurm"]
                 for decorator in next(
                     step for step in self.flow if step.name == self.step
                 ).decorators
@@ -241,7 +264,25 @@ class CondaStepDecorator(StepDecorator):
                 ),
             )
         )
-        # TODO: Register metadata
+
+        # Infer environment prefix from Python interpreter
+        match = re.search(
+            r"(?:.*\/)(metaflow\/[^/]+\/[^/]+)(?=\/bin\/python)", sys.executable
+        )
+        if match:
+            meta.register_metadata(
+                run_id,
+                step_name,
+                task_id,
+                [
+                    MetaDatum(
+                        field="conda_env_prefix",
+                        value=match.group(1),
+                        type="conda_env_prefix",
+                        tags=["attempt_id:{0}".format(retry_count)],
+                    )
+                ],
+            )
 
     def runtime_step_cli(
         self, cli_args, retry_count, max_user_code_retries, ubf_context
@@ -276,15 +317,15 @@ class CondaFlowDecorator(FlowDecorator):
 
     Parameters
     ----------
-    packages : Dict[str, str], default: {}
+    packages : Dict[str, str], default {}
         Packages to use for this flow. The key is the name of the package
         and the value is the version to use.
-    libraries : Dict[str, str], default: {}
+    libraries : Dict[str, str], default {}
         Supported for backward compatibility. When used with packages, packages will take precedence.
-    python : str, optional
+    python : str, optional, default None
         Version of Python to use, e.g. '3.7.4'. A default value of None implies
         that the version used will correspond to the version of the Python interpreter used to start the run.
-    disabled : bool, default: False
+    disabled : bool, default False
         If set to True, disables Conda.
     """
 
@@ -298,7 +339,14 @@ class CondaFlowDecorator(FlowDecorator):
     }
 
     def __init__(self, attributes=None, statically_defined=False):
+        self._attributes_with_user_values = (
+            set(attributes.keys()) if attributes is not None else set()
+        )
+
         super(CondaFlowDecorator, self).__init__(attributes, statically_defined)
+
+    def init(self):
+        super(CondaFlowDecorator, self).init()
 
         # Support legacy 'libraries=' attribute for the decorator.
         self.attributes["packages"] = {
@@ -309,9 +357,18 @@ class CondaFlowDecorator(FlowDecorator):
         if self.attributes["python"]:
             self.attributes["python"] = str(self.attributes["python"])
 
+    def is_attribute_user_defined(self, name):
+        return name in self._attributes_with_user_values
+
     def flow_init(
         self, flow, graph, environment, flow_datastore, metadata, logger, echo, options
     ):
+        # NOTE: Important for extensions implementing custom virtual environments.
+        # Without this steps will not have an implicit conda step decorator on them unless the environment adds one in its decospecs.
+        from metaflow import decorators
+
+        decorators._attach_decorators(flow, ["conda"])
+
         # @conda uses a conda environment to create a virtual environment.
         # The conda environment can be created through micromamba.
         _supported_virtual_envs = ["conda"]
@@ -319,6 +376,10 @@ class CondaFlowDecorator(FlowDecorator):
         # To placate people who don't want to see a shred of conda in UX, we symlink
         # --environment=pypi to --environment=conda
         _supported_virtual_envs.extend(["pypi"])
+
+        # TODO: Hardcoded for now to support the fast bakery environment.
+        # We should introduce a more robust mechanism for appending supported environments, for example from within extensions.
+        _supported_virtual_envs.extend(["fast-bakery"])
 
         # The --environment= requirement ensures that valid virtual environments are
         # created for every step to execute it, greatly simplifying the @conda

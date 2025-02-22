@@ -110,6 +110,7 @@ import importlib
 import os
 import sys
 from metaflow.plugins.env_escape.client_modules import ModuleImporter
+from metaflow.metaflow_config import ESCAPE_HATCH_WARNING
 
 # This is a trampoline file to ensure that the ModuleImporter to handle the emulated
 # modules gets properly loaded. If multiple modules are emulated by a single configuration
@@ -123,9 +124,9 @@ def load():
     cur_path = os.path.dirname(__file__)
     sys.path = [p for p in old_paths if p != cur_path]
     # Handle special case where we launch a shell (including with a command)
-    # and we are in the CWD (searched if '' is the first element of sys.path)
-    if cur_path == os.getcwd() and sys.path[0] == '':
-        sys.path = sys.path[1:]
+    # and we are in the CWD (searched if '' is present in sys.path)
+    if cur_path == os.getcwd() and '' in sys.path:
+        sys.path.remove("")
 
     # Remove the module (this file) to reload it properly. Do *NOT* update sys.modules but
     # modify directly since it may be referenced elsewhere
@@ -146,7 +147,7 @@ def load():
             # print("Env escape using executable {python_executable}")
         else:
             # Inverse logic as above here.
-            if sys.executable != "{python_executable}":
+            if sys.executable != "{python_executable}" and ESCAPE_HATCH_WARNING:
                 # We use the package locally and warn user.
                 print("Not using environment escape for '%s' as module present" % prefix)
             # In both cases, we don't load our loader since

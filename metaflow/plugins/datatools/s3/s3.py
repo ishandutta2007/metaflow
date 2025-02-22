@@ -12,7 +12,7 @@ from tempfile import mkdtemp, NamedTemporaryFile
 from typing import Dict, Iterable, List, Optional, Tuple, Union, TYPE_CHECKING
 
 from metaflow import FlowSpec
-from metaflow.current import current
+from metaflow.metaflow_current import current
 from metaflow.metaflow_config import (
     DATATOOLS_S3ROOT,
     S3_RETRY_COUNT,
@@ -21,7 +21,6 @@ from metaflow.metaflow_config import (
     TEMPDIR,
 )
 from metaflow.util import (
-    namedtuple_with_defaults,
     is_stringish,
     to_bytes,
     to_unicode,
@@ -29,6 +28,7 @@ from metaflow.util import (
     url_quote,
     url_unquote,
 )
+from metaflow.tuple_util import namedtuple_with_defaults
 from metaflow.exception import MetaflowException
 from metaflow.debug import debug
 import metaflow.tracing as tracing
@@ -49,17 +49,27 @@ from .s3util import (
 )
 
 if TYPE_CHECKING:
-    from metaflow.client import Run
+    import metaflow
 
-try:
-    import boto3
-    from boto3.s3.transfer import TransferConfig
 
-    DOWNLOAD_FILE_THRESHOLD = 2 * TransferConfig().multipart_threshold
-    DOWNLOAD_MAX_CHUNK = 2 * 1024 * 1024 * 1024 - 1
-    boto_found = True
-except:
-    boto_found = False
+def _check_and_init_s3_deps():
+    try:
+        import boto3
+        from boto3.s3.transfer import TransferConfig
+    except (ImportError, ModuleNotFoundError):
+        raise MetaflowException("You need to install 'boto3' in order to use S3.")
+
+
+def check_s3_deps(func):
+    """The decorated function checks S3 dependencies (as needed for AWS S3 storage backend).
+    This includes boto3.
+    """
+
+    def _inner_func(*args, **kwargs):
+        _check_and_init_s3_deps()
+        return func(*args, **kwargs)
+
+    return _inner_func
 
 
 TEST_INJECT_RETRYABLE_FAILURES = int(
@@ -144,7 +154,7 @@ class S3Object(object):
         content_type: Optional[str] = None,
         metadata: Optional[Dict[str, str]] = None,
         range_info: Optional[RangeInfo] = None,
-        last_modified: int = None,
+        last_modified: Optional[int] = None,
         encryption: Optional[str] = None,
     ):
         # all fields of S3Object should return a unicode object
@@ -494,23 +504,23 @@ class S3(object):
         If `run` is not specified, use this as the S3 prefix.
     """
 
+    TYPE = "s3"
+
     @classmethod
     def get_root_from_config(cls, echo, create_on_absent=True):
         return DATATOOLS_S3ROOT
 
+    @check_s3_deps
     def __init__(
         self,
         tmproot: str = TEMPDIR,
         bucket: Optional[str] = None,
         prefix: Optional[str] = None,
-        run: Optional[Union[FlowSpec, "Run"]] = None,
+        run: Optional[Union[FlowSpec, "metaflow.Run"]] = None,
         s3root: Optional[str] = None,
         encryption: Optional[str] = S3_SERVER_SIDE_ENCRYPTION,
         **kwargs
     ):
-        if not boto_found:
-            raise MetaflowException("You need to install 'boto3' in order to use S3.")
-
         if run:
             # 1. use a (current) run ID with optional customizations
             if DATATOOLS_S3ROOT is None:
@@ -590,7 +600,9 @@ class S3(object):
         # returned are Unicode.
         key = getattr(key_value, "key", key_value)
         if self._s3root is None:
-            parsed = urlparse(to_unicode(key))
+            # NOTE: S3 allows fragments as part of object names, e.g. /dataset #1/data.txt
+            # Without allow_fragments=False the parsed.path for an object name with fragments is incomplete.
+            parsed = urlparse(to_unicode(key), allow_fragments=False)
             if parsed.scheme == "s3" and parsed.path:
                 return key
             else:
@@ -663,12 +675,12 @@ class S3(object):
 
         Parameters
         ----------
-        keys : Iterable[str], optional
+        keys : Iterable[str], optional, default None
             List of paths.
 
         Returns
         -------
-        List[`S3Object`]
+        List[S3Object]
             S3Objects under the given paths, including prefixes (directories) that
             do not correspond to leaf objects.
         """
@@ -712,12 +724,12 @@ class S3(object):
 
         Parameters
         ----------
-        keys : Iterable[str], optional
+        keys : Iterable[str], optional, default None
             List of paths.
 
         Returns
         -------
-        List[`S3Object`]
+        List[S3Object]
             S3Objects under the given paths.
         """
 
@@ -741,21 +753,23 @@ class S3(object):
 
         Parameters
         ----------
-        key : str, optional
+        key : str, optional, default None
             Object to query. It can be an S3 url or a path suffix.
-        return_missing : bool, default: False
+        return_missing : bool, default False
             If set to True, do not raise an exception for a missing key but
             return it as an `S3Object` with `.exists == False`.
 
         Returns
         -------
-        `S3Object`
+        S3Object
             An S3Object corresponding to the object requested. The object
             will have `.downloaded == False`.
         """
 
         url = self._url(key)
-        src = urlparse(url)
+        # NOTE: S3 allows fragments as part of object names, e.g. /dataset #1/data.txt
+        # Without allow_fragments=False the parsed src.path for an object name with fragments is incomplete.
+        src = urlparse(url, allow_fragments=False)
 
         def _info(s3, tmp):
             resp = s3.head_object(Bucket=src.netloc, Key=src.path.lstrip('/"'))
@@ -801,14 +815,14 @@ class S3(object):
         ----------
         keys : Iterable[str]
             Objects to query. Each key can be an S3 url or a path suffix.
-        return_missing : bool, default: False
+        return_missing : bool, default False
             If set to True, do not raise an exception for a missing key but
             return it as an `S3Object` with `.exists == False`.
 
         Returns
         -------
-        List[`S3Object`]
-            A list of `S3Object`s corresponding to the paths requested. The
+        List[S3Object]
+            A list of S3Objects corresponding to the paths requested. The
             objects will have `.downloaded == False`.
         """
 
@@ -859,24 +873,31 @@ class S3(object):
 
         Parameters
         ----------
-        key : str or `S3GetObject`, optional
+        key : Union[str, S3GetObject], optional, default None
             Object to download. It can be an S3 url, a path suffix, or
-            an `S3GetObject` that defines a range of data to download. If None, or
+            an S3GetObject that defines a range of data to download. If None, or
             not provided, gets the S3 root.
-        return_missing : bool, default: False
+        return_missing : bool, default False
             If set to True, do not raise an exception for a missing key but
             return it as an `S3Object` with `.exists == False`.
-        return_info : bool, default: True
+        return_info : bool, default True
             If set to True, fetch the content-type and user metadata associated
             with the object at no extra cost, included for symmetry with `get_many`
 
         Returns
         -------
-        `S3Object`
+        S3Object
             An S3Object corresponding to the object requested.
         """
+        from boto3.s3.transfer import TransferConfig
+
+        DOWNLOAD_FILE_THRESHOLD = 2 * TransferConfig().multipart_threshold
+        DOWNLOAD_MAX_CHUNK = 2 * 1024 * 1024 * 1024 - 1
+
         url, r = self._url_and_range(key)
-        src = urlparse(url)
+        # NOTE: S3 allows fragments as part of object names, e.g. /dataset #1/data.txt
+        # Without allow_fragments=False the parsed src.path for an object name with fragments is incomplete.
+        src = urlparse(url, allow_fragments=False)
 
         def _download(s3, tmp):
             if r:
@@ -959,19 +980,19 @@ class S3(object):
 
         Parameters
         ----------
-        keys : Iterable[str or `S3GetObject`]
+        keys : Iterable[Union[str, S3GetObject]]
             Objects to download. Each object can be an S3 url, a path suffix, or
-            an `S3GetObject` that defines a range of data to download.
-        return_missing : bool, default: False
+            an S3GetObject that defines a range of data to download.
+        return_missing : bool, default False
             If set to True, do not raise an exception for a missing key but
             return it as an `S3Object` with `.exists == False`.
-        return_info : bool, default: True
+        return_info : bool, default True
             If set to True, fetch the content-type and user metadata associated
             with the object at no extra cost, included for symmetry with `get_many`.
 
         Returns
         -------
-        List[`S3Object`]
+        List[S3Object]
             S3Objects corresponding to the objects requested.
         """
 
@@ -1034,13 +1055,13 @@ class S3(object):
         keys : Iterable[str]
             Prefixes to download recursively. Each prefix can be an S3 url or a path suffix
             which define the root prefix under which all objects are downloaded.
-        return_info : bool, default: False
+        return_info : bool, default False
             If set to True, fetch the content-type and user metadata associated
             with the object.
 
         Returns
         -------
-        List[`S3Object`]
+        List[S3Object]
             S3Objects stored under the given prefixes.
         """
 
@@ -1088,13 +1109,13 @@ class S3(object):
 
         Parameters
         ----------
-        return_info : bool, default: False
+        return_info : bool, default False
             If set to True, fetch the content-type and user metadata associated
             with the object.
 
         Returns
         -------
-        Iterable[`S3Object`]
+        Iterable[S3Object]
             S3Objects stored under the main prefix.
         """
 
@@ -1118,16 +1139,16 @@ class S3(object):
 
         Parameters
         ----------
-        key : str or `S3PutObject`
+        key : Union[str, S3PutObject]
             Object path. It can be an S3 url or a path suffix.
-        obj : bytes or str
+        obj : PutValue
             An object to store in S3. Strings are converted to UTF-8 encoding.
-        overwrite : bool, default: True
+        overwrite : bool, default True
             Overwrite the object if it exists. If set to False, the operation
             succeeds without uploading anything if the key already exists.
-        content_type : str, optional
+        content_type : str, optional, default None
             Optional MIME type for the object.
-        metadata : Dict, optional
+        metadata : Dict[str, str], optional, default None
             A JSON-encodable dictionary of additional headers to be stored
             as metadata with the object.
 
@@ -1158,7 +1179,9 @@ class S3(object):
         blob.close = lambda: None
 
         url = self._url(key)
-        src = urlparse(url)
+        # NOTE: S3 allows fragments as part of object names, e.g. /dataset #1/data.txt
+        # Without allow_fragments=False the parsed src.path for an object name with fragments is incomplete.
+        src = urlparse(url, allow_fragments=False)
         extra_args = None
         if content_type or metadata or self._encryption:
             extra_args = {}
@@ -1218,26 +1241,26 @@ class S3(object):
 
         Parameters
         ----------
-        key_objs : List[(str, str) or `S3PutObject`]
+        key_objs : List[Union[Tuple[str, PutValue], S3PutObject]]
             List of key-object pairs to upload.
-        overwrite : bool, default : True
+        overwrite : bool, default True
             Overwrite the object if it exists. If set to False, the operation
             succeeds without uploading anything if the key already exists.
 
         Returns
         -------
-        List[(str, str)]
+        List[Tuple[str, str]]
             List of `(key, url)` pairs corresponding to the objects uploaded.
         """
 
         def _store():
             for key_obj in key_objs:
-                if isinstance(key_obj, tuple):
-                    key = key_obj[0]
-                    obj = key_obj[1]
-                else:
+                if isinstance(key_obj, S3PutObject):
                     key = key_obj.key
                     obj = key_obj.value
+                else:
+                    key = key_obj[0]
+                    obj = key_obj[1]
                 store_info = {
                     "key": key,
                     "content_type": getattr(key_obj, "content_type", None),
@@ -1292,26 +1315,26 @@ class S3(object):
 
         Parameters
         ----------
-        key_paths : List[(str, str) or `S3PutObject`]
+        key_paths :  List[Union[Tuple[str, PutValue], S3PutObject]]
             List of files to upload.
-        overwrite : bool, default: True
+        overwrite : bool, default True
             Overwrite the object if it exists. If set to False, the operation
             succeeds without uploading anything if the key already exists.
 
         Returns
         -------
-        List[(str, str)]
+        List[Tuple[str, str]]
             List of `(key, url)` pairs corresponding to the files uploaded.
         """
 
         def _check():
             for key_path in key_paths:
-                if isinstance(key_path, tuple):
-                    key = key_path[0]
-                    path = key_path[1]
-                else:
+                if isinstance(key_path, S3PutObject):
                     key = key_path.key
                     path = key_path.path
+                else:
+                    key = key_path[0]
+                    path = key_path[1]
                 store_info = {
                     "key": key,
                     "content_type": getattr(key_path, "content_type", None),
@@ -1613,6 +1636,7 @@ class S3(object):
                         # Run the operation.
                         env = os.environ.copy()
                         tracing.inject_tracing_vars(env)
+                        env["METAFLOW_ESCAPE_HATCH_WARNING"] = "False"
                         stdout = subprocess.check_output(
                             cmdline + addl_cmdline,
                             cwd=self._tmpdir,

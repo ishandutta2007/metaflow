@@ -1,6 +1,4 @@
 import json
-import os
-import sys
 
 from metaflow.exception import MetaflowException
 from metaflow.plugins.kubernetes.kubernetes_client import KubernetesClient
@@ -8,6 +6,14 @@ from metaflow.plugins.kubernetes.kubernetes_client import KubernetesClient
 
 class ArgoClientException(MetaflowException):
     headline = "Argo Client error"
+
+
+class ArgoResourceNotFound(MetaflowException):
+    headline = "Resource not found"
+
+
+class ArgoNotPermitted(MetaflowException):
+    headline = "Operation not permitted"
 
 
 class ArgoClient(object):
@@ -140,9 +146,7 @@ class ArgoClient(object):
             if e.status == 404:
                 return None
             else:
-                raise ArgoClientException(
-                    json.loads(e.body)["message"] if e.body is not None else e.reason
-                )
+                raise wrap_api_error(e)
 
     def delete_workflow_template(self, name):
         """
@@ -164,9 +168,7 @@ class ArgoClient(object):
             if e.status == 404:
                 return None
             else:
-                raise ArgoClientException(
-                    json.loads(e.body)["message"] if e.body is not None else e.reason
-                )
+                raise wrap_api_error(e)
 
     def terminate_workflow(self, name):
         client = self._client.get()
@@ -295,6 +297,8 @@ class ArgoClient(object):
                 "suspend": schedule is None,
                 "schedule": schedule,
                 "timezone": timezone,
+                "failedJobsHistoryLimit": 10000,  # default is unfortunately 1
+                "successfulJobsHistoryLimit": 10000,  # default is unfortunately 3
                 "workflowSpec": {"workflowTemplateRef": {"name": name}},
             },
         }
@@ -426,6 +430,18 @@ class ArgoClient(object):
         except client.rest.ApiException as e:
             if e.status == 404:
                 return None
-            raise ArgoClientException(
-                json.loads(e.body)["message"] if e.body is not None else e.reason
-            )
+            raise wrap_api_error(e)
+
+
+def wrap_api_error(error):
+    message = (
+        json.loads(error.body)["message"] if error.body is not None else error.reason
+    )
+    # catch all
+    ex = ArgoClientException(message)
+    if error.status == 404:
+        # usually handled outside this function as most cases want to return None instead.
+        ex = ArgoResourceNotFound(message)
+    if error.status == 403:
+        ex = ArgoNotPermitted(message)
+    return ex

@@ -10,7 +10,7 @@ from types import MethodType, FunctionType
 
 from .. import metaflow_config
 from ..exception import MetaflowInternalError
-from ..metadata import DataArtifact, MetaDatum
+from ..metadata_provider import DataArtifact, MetaDatum
 from ..parameters import Parameter
 from ..util import Path, is_stringish, to_fileobj
 
@@ -173,6 +173,26 @@ class TaskDataStore(object):
                 if data_obj is not None:
                     self._objects = data_obj.get("objects", {})
                     self._info = data_obj.get("info", {})
+        elif self._mode == "d":
+            self._objects = {}
+            self._info = {}
+
+            if self._attempt is None:
+                for i in range(metaflow_config.MAX_ATTEMPTS):
+                    check_meta = self._metadata_name_for_attempt(
+                        self.METADATA_ATTEMPT_SUFFIX, i
+                    )
+                    if self.has_metadata(check_meta, add_attempt=False):
+                        self._attempt = i
+
+            # Do not allow destructive operations on the datastore if attempt is still in flight
+            # and we explicitly did not allow operating on running tasks.
+            if not allow_not_done and not self.has_metadata(self.METADATA_DONE_SUFFIX):
+                raise DataException(
+                    "No completed attempts of the task was found for task '%s'"
+                    % self._path
+                )
+
         else:
             raise DataException("Unknown datastore mode: '%s'" % self._mode)
 
@@ -233,7 +253,7 @@ class TaskDataStore(object):
 
     @only_if_not_done
     @require_mode("w")
-    def save_artifacts(self, artifacts_iter, force_v4=False, len_hint=0):
+    def save_artifacts(self, artifacts_iter, len_hint=0):
         """
         Saves Metaflow Artifacts (Python objects) to the datastore and stores
         any relevant metadata needed to retrieve them.
@@ -249,11 +269,6 @@ class TaskDataStore(object):
         artifacts : Iterator[(string, object)]
             Iterator over the human-readable name of the object to save
             and the object itself
-        force_v4 : boolean or Dict[string -> boolean]
-            Indicates whether the artifact should be pickled using the v4
-            version of pickle. If a single boolean, applies to all artifacts.
-            If a dictionary, applies to the object named only. Defaults to False
-            if not present or not specified
         len_hint: integer
             Estimated number of items in artifacts_iter
         """
@@ -261,40 +276,24 @@ class TaskDataStore(object):
 
         def pickle_iter():
             for name, obj in artifacts_iter:
-                do_v4 = (
-                    force_v4 and force_v4
-                    if isinstance(force_v4, bool)
-                    else force_v4.get(name, False)
-                )
-                if do_v4:
-                    encode_type = "gzip+pickle-v4"
-                    if encode_type not in self._encodings:
-                        raise DataException(
-                            "Artifact *%s* requires a serialization encoding that "
-                            "requires Python 3.4 or newer." % name
-                        )
+                encode_type = "gzip+pickle-v4"
+                if encode_type in self._encodings:
                     try:
                         blob = pickle.dumps(obj, protocol=4)
                     except TypeError as e:
-                        raise UnpicklableArtifactException(name)
+                        raise UnpicklableArtifactException(name) from e
                 else:
                     try:
                         blob = pickle.dumps(obj, protocol=2)
                         encode_type = "gzip+pickle-v2"
-                    except (SystemError, OverflowError):
-                        encode_type = "gzip+pickle-v4"
-                        if encode_type not in self._encodings:
-                            raise DataException(
-                                "Artifact *%s* is very large (over 2GB). "
-                                "You need to use Python 3.4 or newer if you want to "
-                                "serialize large objects." % name
-                            )
-                        try:
-                            blob = pickle.dumps(obj, protocol=4)
-                        except TypeError as e:
-                            raise UnpicklableArtifactException(name)
+                    except (SystemError, OverflowError) as e:
+                        raise DataException(
+                            "Artifact *%s* is very large (over 2GB). "
+                            "You need to use Python 3.4 or newer if you want to "
+                            "serialize large objects." % name
+                        ) from e
                     except TypeError as e:
-                        raise UnpicklableArtifactException(name)
+                        raise UnpicklableArtifactException(name) from e
 
                 self._info[name] = {
                     "size": len(blob),
@@ -361,7 +360,7 @@ class TaskDataStore(object):
         # We assume that if we have one "old" style artifact, all of them are
         # like that which is an easy assumption to make since artifacts are all
         # stored by the same implementation of the datastore for a given task.
-        for (key, blob) in self._ca_store.load_blobs(to_load.keys()):
+        for key, blob in self._ca_store.load_blobs(to_load.keys()):
             names = to_load[key]
             for name in names:
                 # We unpickle everytime to have fully distinct objects (the user
@@ -749,6 +748,36 @@ class TaskDataStore(object):
             else:
                 to_store_dict[n] = data
         self._save_file(to_store_dict)
+
+    @require_mode("d")
+    def scrub_logs(self, logsources, stream, attempt_override=None):
+        path_logsources = {
+            self._metadata_name_for_attempt(
+                self._get_log_location(s, stream),
+                attempt_override=attempt_override,
+            ): s
+            for s in logsources
+        }
+
+        # Legacy log paths
+        legacy_log = self._metadata_name_for_attempt(
+            "%s.log" % stream, attempt_override
+        )
+        path_logsources[legacy_log] = stream
+
+        existing_paths = [
+            path
+            for path in path_logsources.keys()
+            if self.has_metadata(path, add_attempt=False)
+        ]
+
+        # Replace log contents with [REDACTED source stream]
+        to_store_dict = {
+            path: bytes("[REDACTED %s %s]" % (path_logsources[path], stream), "utf-8")
+            for path in existing_paths
+        }
+
+        self._save_file(to_store_dict, add_attempt=False, allow_overwrite=True)
 
     @require_mode("r")
     def load_log_legacy(self, stream, attempt_override=None):

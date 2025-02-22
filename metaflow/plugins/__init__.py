@@ -1,3 +1,5 @@
+import sys
+
 from metaflow.extension_support.plugins import (
     merge_lists,
     process_plugins,
@@ -14,7 +16,14 @@ CLIS_DESC = [
     ("argo-workflows", ".argo.argo_workflows_cli.cli"),
     ("card", ".cards.card_cli.cli"),
     ("tag", ".tag_cli.cli"),
+    ("spot-metadata", ".kubernetes.spot_metadata_cli.cli"),
+    ("logs", ".logs_cli.cli"),
 ]
+
+# Add additional commands to the runner here
+# These will be accessed using Runner().<command>()
+RUNNER_CLIS_DESC = []
+
 
 from .test_unbounded_foreach_decorator import InternalTestUnboundedForeachInput
 
@@ -70,8 +79,8 @@ ENVIRONMENTS_DESC = [
 
 # Add metadata providers here
 METADATA_PROVIDERS_DESC = [
-    ("service", ".metadata.service.ServiceMetadataProvider"),
-    ("local", ".metadata.local.LocalMetadataProvider"),
+    ("service", ".metadata_providers.service.ServiceMetadataProvider"),
+    ("local", ".metadata_providers.local.LocalMetadataProvider"),
 ]
 
 # Add datastore here
@@ -82,13 +91,25 @@ DATASTORES_DESC = [
     ("gs", ".datastores.gs_storage.GSStorage"),
 ]
 
+# Dataclients are used for IncludeFile
+DATACLIENTS_DESC = [
+    ("local", ".datatools.Local"),
+    ("s3", ".datatools.S3"),
+    ("azure", ".azure.includefile_support.Azure"),
+    ("gs", ".gcp.includefile_support.GS"),
+]
+
 # Add non monitoring/logging sidecars here
 SIDECARS_DESC = [
     (
         "save_logs_periodically",
         "..mflog.save_logs_periodically.SaveLogsPeriodicallySidecar",
     ),
-    ("heartbeat", "metaflow.metadata.heartbeat.MetadataHeartBeat"),
+    (
+        "spot_termination_monitor",
+        ".kubernetes.spot_monitor_sidecar.SpotTerminationMonitorSidecar",
+    ),
+    ("heartbeat", "metaflow.metadata_provider.heartbeat.MetadataHeartBeat"),
 ]
 
 # Add logging sidecars here
@@ -120,6 +141,30 @@ SECRETS_PROVIDERS_DESC = [
         "aws-secrets-manager",
         ".aws.secrets_manager.aws_secrets_manager_secrets_provider.AwsSecretsManagerSecretsProvider",
     ),
+    (
+        "gcp-secret-manager",
+        ".gcp.gcp_secret_manager_secrets_provider.GcpSecretManagerSecretsProvider",
+    ),
+    (
+        "az-key-vault",
+        ".azure.azure_secret_manager_secrets_provider.AzureKeyVaultSecretsProvider",
+    ),
+]
+
+GCP_CLIENT_PROVIDERS_DESC = [
+    ("gcp-default", ".gcp.gs_storage_client_factory.GcpDefaultClientProvider")
+]
+
+AZURE_CLIENT_PROVIDERS_DESC = [
+    ("azure-default", ".azure.azure_credential.AzureDefaultClientProvider")
+]
+
+DEPLOYER_IMPL_PROVIDERS_DESC = [
+    ("argo-workflows", ".argo.argo_workflows_deployer.ArgoWorkflowsDeployer"),
+    (
+        "step-functions",
+        ".aws.step_functions.step_functions_deployer.StepFunctionsDeployer",
+    ),
 ]
 
 process_plugins(globals())
@@ -129,11 +174,24 @@ def get_plugin_cli():
     return resolve_plugins("cli")
 
 
+def get_plugin_cli_path():
+    return resolve_plugins("cli", path_only=True)
+
+
+def get_runner_cli():
+    return resolve_plugins("runner_cli")
+
+
+def get_runner_cli_path():
+    return resolve_plugins("runner_cli", path_only=True)
+
+
 STEP_DECORATORS = resolve_plugins("step_decorator")
 FLOW_DECORATORS = resolve_plugins("flow_decorator")
 ENVIRONMENTS = resolve_plugins("environment")
 METADATA_PROVIDERS = resolve_plugins("metadata_provider")
 DATASTORES = resolve_plugins("datastore")
+DATACLIENTS = resolve_plugins("dataclient")
 SIDECARS = resolve_plugins("sidecar")
 LOGGING_SIDECARS = resolve_plugins("logging_sidecar")
 MONITOR_SIDECARS = resolve_plugins("monitor_sidecar")
@@ -143,6 +201,11 @@ SIDECARS.update(MONITOR_SIDECARS)
 
 AWS_CLIENT_PROVIDERS = resolve_plugins("aws_client_provider")
 SECRETS_PROVIDERS = resolve_plugins("secrets_provider")
+AZURE_CLIENT_PROVIDERS = resolve_plugins("azure_client_provider")
+GCP_CLIENT_PROVIDERS = resolve_plugins("gcp_client_provider")
+
+if sys.version_info >= (3, 7):
+    DEPLOYER_IMPL_PROVIDERS = resolve_plugins("deployer_impl_provider")
 
 from .cards.card_modules import MF_EXTERNAL_CARDS
 
@@ -166,6 +229,8 @@ from .cards.card_modules.test_cards import (
     TestNonEditableCard,
     TestPathSpecCard,
     TestTimeoutCard,
+    TestRefreshCard,
+    TestRefreshComponentCard,
 )
 
 CARDS = [
@@ -182,5 +247,7 @@ CARDS = [
     TestNonEditableCard,
     BlankCard,
     DefaultCardJSON,
+    TestRefreshCard,
+    TestRefreshComponentCard,
 ]
 merge_lists(CARDS, MF_EXTERNAL_CARDS, "type")

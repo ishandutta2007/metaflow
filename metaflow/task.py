@@ -4,13 +4,15 @@ import math
 import sys
 import os
 import time
+import traceback
 
 from types import MethodType, FunctionType
 
+from metaflow.sidecar import Message, MessageTypes
 from metaflow.datastore.exceptions import DataException
 
 from .metaflow_config import MAX_ATTEMPTS
-from .metadata import MetaDatum
+from .metadata_provider import MetaDatum
 from .mflog import TASK_LOG_SOURCE
 from .datastore import Inputs, TaskDataStoreSet
 from .exception import (
@@ -20,11 +22,14 @@ from .exception import (
 )
 from .unbounded_foreach import UBF_CONTROL
 from .util import all_equal, get_username, resolve_identity, unicode_type
-from .current import current
+from .clone_util import clone_task_helper
+from .metaflow_current import current
+from metaflow.system import _system_logger, _system_monitor
 from metaflow.tracing import get_trace_id
-from collections import namedtuple
+from metaflow.tuple_util import ForeachFrame
 
-ForeachFrame = namedtuple("ForeachFrame", ["step", "var", "num_splits", "index"])
+# Maximum number of characters of the foreach path that we store in the metadata.
+MAX_FOREACH_PATH_LENGTH = 256
 
 
 class MetaflowTask(object):
@@ -59,7 +64,6 @@ class MetaflowTask(object):
             step_function(input_obj)
 
     def _init_parameters(self, parameter_ds, passdown=True):
-
         cls = self.flow.__class__
 
         def _set_cls_var(_, __):
@@ -176,6 +180,10 @@ class MetaflowTask(object):
         # 2) join - pop the topmost frame from the stack
         # 3) step following a split - push a new frame in the stack
 
+        # We have a non-modifying case (case 4)) where we propagate the
+        # foreach-stack information to all tasks in the foreach. This is
+        # then used later to write the foreach-stack metadata for that task
+
         # case 1) - reset the stack
         if step_name == "start":
             self.flow._foreach_stack = []
@@ -188,10 +196,10 @@ class MetaflowTask(object):
                     if join_type == "foreach":
                         top = i["_foreach_stack"][-1]
                         bottom = i["_foreach_stack"][:-1]
-                        # the topmost indices in the stack are all
-                        # different naturally, so ignore them in the
+                        # the topmost indices and values in the stack are
+                        # all different naturally, so ignore them in the
                         # assertion
-                        yield bottom + [top._replace(index=0)]
+                        yield bottom + [top._replace(index=0, value=0)]
                     else:
                         yield i["_foreach_stack"]
 
@@ -243,17 +251,26 @@ class MetaflowTask(object):
                     "specified." % step_name
                 )
 
+            split_value = (
+                inputs[0]["_foreach_values"][split_index]
+                if not inputs[0].is_none("_foreach_values")
+                else None
+            )
             # push a new index after a split to the stack
             frame = ForeachFrame(
                 step_name,
                 inputs[0]["_foreach_var"],
                 inputs[0]["_foreach_num_splits"],
                 split_index,
+                split_value,
             )
 
             stack = inputs[0]["_foreach_stack"]
             stack.append(frame)
             self.flow._foreach_stack = stack
+        # case 4) - propagate in the foreach nest
+        elif "_foreach_stack" in inputs[0]:
+            self.flow._foreach_stack = inputs[0]["_foreach_stack"]
 
     def _clone_flow(self, datastore):
         x = self.flow.__class__(use_cli=False)
@@ -267,70 +284,58 @@ class MetaflowTask(object):
         task_id,
         clone_origin_task,
         retry_count,
-        wait_only=False,
     ):
         if not clone_origin_task:
             raise MetaflowInternalError(
                 "task.clone_only needs a valid clone_origin_task value."
             )
-        if wait_only:
-            # In this case, we are actually going to wait for the clone to be done
-            # by someone else. To do this, we just get the task_datastore in "r" mode
-            while True:
-                try:
-                    ds = self.flow_datastore.get_task_datastore(
-                        run_id, step_name, task_id
-                    )
-                    if not ds["_task_ok"]:
-                        raise MetaflowInternalError(
-                            "Externally cloned task did not succeed"
-                        )
-                    break
-                except DataException:
-                    # No need to get fancy with the sleep here.
-                    time.sleep(5)
-            return
-        # If we actually have to do the clone ourselves, proceed...
-        # 1. initialize output datastore
-        output = self.flow_datastore.get_task_datastore(
-            run_id, step_name, task_id, attempt=0, mode="w"
-        )
+        origin_run_id, _, origin_task_id = clone_origin_task.split("/")
+        # Update system logger and monitor context
+        # We also pass this context as part of the task payload to support implementations that
+        # can't access the context directly
+        task_payload = {
+            "run_id": run_id,
+            "step_name": step_name,
+            "task_id": task_id,
+            "retry_count": retry_count,
+            "project_name": current.get("project_name"),
+            "branch_name": current.get("branch_name"),
+            "is_user_branch": current.get("is_user_branch"),
+            "is_production": current.get("is_production"),
+            "project_flow_name": current.get("project_flow_name"),
+            "origin_run_id": origin_run_id,
+            "origin_task_id": origin_task_id,
+        }
 
-        output.init_task()
-
-        origin_run_id, origin_step_name, origin_task_id = clone_origin_task.split("/")
-        # 2. initialize origin datastore
-        origin = self.flow_datastore.get_task_datastore(
-            origin_run_id, origin_step_name, origin_task_id
-        )
-        metadata_tags = ["attempt_id:{0}".format(retry_count)]
-        output.clone(origin)
-        self.metadata.register_metadata(
+        msg = "Cloning task from {}/{}/{}/{} to {}/{}/{}/{}".format(
+            self.flow.name,
+            origin_run_id,
+            step_name,
+            origin_task_id,
+            self.flow.name,
             run_id,
             step_name,
             task_id,
-            [
-                MetaDatum(
-                    field="origin-task-id",
-                    value=str(origin_task_id),
-                    type="origin-task-id",
-                    tags=metadata_tags,
-                ),
-                MetaDatum(
-                    field="origin-run-id",
-                    value=str(origin_run_id),
-                    type="origin-run-id",
-                    tags=metadata_tags,
-                ),
-                MetaDatum(
-                    field="attempt",
-                    value=str(retry_count),
-                    type="attempt",
-                    tags=metadata_tags,
-                ),
-            ],
         )
-        output.done()
+        with _system_monitor.count("metaflow.task.clone"):
+            _system_logger.log_event(
+                level="info",
+                module="metaflow.task",
+                name="clone",
+                payload={**task_payload, "msg": msg},
+            )
+        # If we actually have to do the clone ourselves, proceed...
+        clone_task_helper(
+            self.flow.name,
+            origin_run_id,
+            run_id,
+            step_name,
+            origin_task_id,
+            task_id,
+            self.flow_datastore,
+            self.metadata,
+            attempt_id=retry_count,
+        )
 
     def _finalize_control_task(self):
         # Update `_transition` which is expected by the NativeRuntime.
@@ -378,7 +383,6 @@ class MetaflowTask(object):
         retry_count,
         max_user_code_retries,
     ):
-
         if run_id and task_id:
             self.metadata.register_run_id(run_id)
             self.metadata.register_task_id(run_id, step_name, task_id, retry_count)
@@ -434,13 +438,6 @@ class MetaflowTask(object):
                 )
             )
 
-        self.metadata.register_metadata(
-            run_id,
-            step_name,
-            task_id,
-            metadata,
-        )
-
         step_func = getattr(self.flow, step_name)
         decorators = step_func.decorators
 
@@ -463,6 +460,65 @@ class MetaflowTask(object):
             # 3. initialize foreach state
             self._init_foreach(step_name, join_type, inputs, split_index)
 
+            # Add foreach stack to metadata of the task
+
+            foreach_stack = (
+                self.flow._foreach_stack
+                if hasattr(self.flow, "_foreach_stack") and self.flow._foreach_stack
+                else []
+            )
+
+            foreach_stack_formatted = []
+            current_foreach_path_length = 0
+            for frame in foreach_stack:
+                if not (frame.var and frame.value):
+                    break
+
+                foreach_step = "%s=%s" % (frame.var, frame.value)
+                if (
+                    current_foreach_path_length + len(foreach_step)
+                    > MAX_FOREACH_PATH_LENGTH
+                ):
+                    break
+                current_foreach_path_length += len(foreach_step)
+                foreach_stack_formatted.append(foreach_step)
+
+            if foreach_stack_formatted:
+                metadata.append(
+                    MetaDatum(
+                        field="foreach-stack",
+                        value=foreach_stack_formatted,
+                        type="foreach-stack",
+                        tags=metadata_tags,
+                    )
+                )
+
+            # Add runtime dag information to the metadata of the task
+            foreach_execution_path = ",".join(
+                [
+                    "{}:{}".format(foreach_frame.step, foreach_frame.index)
+                    for foreach_frame in foreach_stack
+                ]
+            )
+            if foreach_execution_path:
+                metadata.extend(
+                    [
+                        MetaDatum(
+                            field="foreach-execution-path",
+                            value=foreach_execution_path,
+                            type="foreach-execution-path",
+                            tags=metadata_tags,
+                        ),
+                    ]
+                )
+
+        self.metadata.register_metadata(
+            run_id,
+            step_name,
+            task_id,
+            metadata,
+        )
+
         # 4. initialize the current singleton
         current._set_env(
             flow=self.flow,
@@ -473,8 +529,7 @@ class MetaflowTask(object):
             origin_run_id=origin_run_id,
             namespace=resolve_identity(),
             username=get_username(),
-            metadata_str="%s@%s"
-            % (self.metadata.__class__.TYPE, self.metadata.__class__.INFO),
+            metadata_str=self.metadata.metadata_str(),
             is_running=True,
             tags=self.metadata.sticky_tags,
         )
@@ -490,204 +545,239 @@ class MetaflowTask(object):
                 }
             }
         )
-        logger = self.event_logger
+
+        # 6. Update system logger and monitor context
+        # We also pass this context as part of the task payload to support implementations that
+        # can't access the context directly
+
+        task_payload = {
+            "run_id": run_id,
+            "step_name": step_name,
+            "task_id": task_id,
+            "retry_count": retry_count,
+            "project_name": current.get("project_name"),
+            "branch_name": current.get("branch_name"),
+            "is_user_branch": current.get("is_user_branch"),
+            "is_production": current.get("is_production"),
+            "project_flow_name": current.get("project_flow_name"),
+            "trace_id": trace_id or None,
+        }
         start = time.time()
         self.metadata.start_task_heartbeat(self.flow.name, run_id, step_name, task_id)
-        try:
-            msg = {
-                "task_id": task_id,
-                "msg": "task starting",
-                "step_name": step_name,
-                "run_id": run_id,
-                "flow_name": self.flow.name,
-                "ts": round(time.time()),
-            }
-            logger.log(msg)
-
-            self.flow._current_step = step_name
-            self.flow._success = False
-            self.flow._task_ok = None
-            self.flow._exception = None
-            # Note: All internal flow attributes (ie: non-user artifacts)
-            # should either be set prior to running the user code or listed in
-            # FlowSpec._EPHEMERAL to allow for proper merging/importing of
-            # user artifacts in the user's step code.
-
-            if join_type:
-                # Join step:
-
-                # Ensure that we have the right number of inputs. The
-                # foreach case is checked above.
-                if join_type != "foreach" and len(inputs) != len(node.in_funcs):
-                    raise MetaflowDataMissing(
-                        "Join *%s* expected %d "
-                        "inputs but only %d inputs "
-                        "were found" % (step_name, len(node.in_funcs), len(inputs))
+        with self.monitor.measure("metaflow.task.duration"):
+            try:
+                with self.monitor.count("metaflow.task.start"):
+                    _system_logger.log_event(
+                        level="info",
+                        module="metaflow.task",
+                        name="start",
+                        payload={**task_payload, "msg": "Task started"},
                     )
 
-                # Multiple input contexts are passed in as an argument
-                # to the step function.
-                input_obj = Inputs(self._clone_flow(inp) for inp in inputs)
-                self.flow._set_datastore(output)
-                # initialize parameters (if they exist)
-                # We take Parameter values from the first input,
-                # which is always safe since parameters are read-only
-                current._update_env(
-                    {"parameter_names": self._init_parameters(inputs[0], passdown=True)}
-                )
-            else:
-                # Linear step:
-                # We are running with a single input context.
-                # The context is embedded in the flow.
-                if len(inputs) > 1:
-                    # This should be captured by static checking but
-                    # let's assert this again
-                    raise MetaflowInternalError(
-                        "Step *%s* is not a join "
-                        "step but it gets multiple "
-                        "inputs." % step_name
-                    )
-                self.flow._set_datastore(inputs[0])
-                if input_paths:
+                self.flow._current_step = step_name
+                self.flow._success = False
+                self.flow._task_ok = None
+                self.flow._exception = None
+
+                # Note: All internal flow attributes (ie: non-user artifacts)
+                # should either be set prior to running the user code or listed in
+                # FlowSpec._EPHEMERAL to allow for proper merging/importing of
+                # user artifacts in the user's step code.
+
+                if join_type:
+                    # Join step:
+
+                    # Ensure that we have the right number of inputs. The
+                    # foreach case is checked above.
+                    if join_type != "foreach" and len(inputs) != len(node.in_funcs):
+                        raise MetaflowDataMissing(
+                            "Join *%s* expected %d "
+                            "inputs but only %d inputs "
+                            "were found" % (step_name, len(node.in_funcs), len(inputs))
+                        )
+
+                    # Multiple input contexts are passed in as an argument
+                    # to the step function.
+                    input_obj = Inputs(self._clone_flow(inp) for inp in inputs)
+                    self.flow._set_datastore(output)
                     # initialize parameters (if they exist)
                     # We take Parameter values from the first input,
                     # which is always safe since parameters are read-only
                     current._update_env(
                         {
                             "parameter_names": self._init_parameters(
-                                inputs[0], passdown=False
-                            )
+                                inputs[0], passdown=True
+                            ),
+                            "graph_info": self.flow._graph_info,
                         }
                     )
-
-            for deco in decorators:
-
-                deco.task_pre_step(
-                    step_name,
-                    output,
-                    self.metadata,
-                    run_id,
-                    task_id,
-                    self.flow,
-                    self.flow._graph,
-                    retry_count,
-                    max_user_code_retries,
-                    self.ubf_context,
-                    inputs,
-                )
-
-                # decorators can actually decorate the step function,
-                # or they can replace it altogether. This functionality
-                # is used e.g. by catch_decorator which switches to a
-                # fallback code if the user code has failed too many
-                # times.
-                step_func = deco.task_decorate(
-                    step_func,
-                    self.flow,
-                    self.flow._graph,
-                    retry_count,
-                    max_user_code_retries,
-                    self.ubf_context,
-                )
-
-            if join_type:
-                self._exec_step_function(step_func, input_obj)
-            else:
-                self._exec_step_function(step_func)
-
-            for deco in decorators:
-                deco.task_post_step(
-                    step_name,
-                    self.flow,
-                    self.flow._graph,
-                    retry_count,
-                    max_user_code_retries,
-                )
-
-            self.flow._task_ok = True
-            self.flow._success = True
-
-        except Exception as ex:
-            tsk_msg = {
-                "task_id": task_id,
-                "exception_msg": str(ex),
-                "msg": "task failed with exception",
-                "step_name": step_name,
-                "run_id": run_id,
-                "flow_name": self.flow.name,
-            }
-            logger.log(tsk_msg)
-
-            exception_handled = False
-            for deco in decorators:
-                res = deco.task_exception(
-                    ex,
-                    step_name,
-                    self.flow,
-                    self.flow._graph,
-                    retry_count,
-                    max_user_code_retries,
-                )
-                exception_handled = bool(res) or exception_handled
-
-            if exception_handled:
-                self.flow._task_ok = True
-            else:
-                self.flow._task_ok = False
-                self.flow._exception = MetaflowExceptionWrapper(ex)
-                print("%s failed:" % self.flow, file=sys.stderr)
-                raise
-
-        finally:
-            if self.ubf_context == UBF_CONTROL:
-                self._finalize_control_task()
-
-            end = time.time() - start
-
-            msg = {
-                "task_id": task_id,
-                "msg": "task ending",
-                "step_name": step_name,
-                "run_id": run_id,
-                "flow_name": self.flow.name,
-                "ts": round(time.time()),
-                "runtime": round(end),
-            }
-            logger.log(msg)
-
-            attempt_ok = str(bool(self.flow._task_ok))
-            self.metadata.register_metadata(
-                run_id,
-                step_name,
-                task_id,
-                [
-                    MetaDatum(
-                        field="attempt_ok",
-                        value=attempt_ok,
-                        type="internal_attempt_status",
-                        tags=["attempt_id:{0}".format(retry_count)],
+                else:
+                    # Linear step:
+                    # We are running with a single input context.
+                    # The context is embedded in the flow.
+                    if len(inputs) > 1:
+                        # This should be captured by static checking but
+                        # let's assert this again
+                        raise MetaflowInternalError(
+                            "Step *%s* is not a join "
+                            "step but it gets multiple "
+                            "inputs." % step_name
+                        )
+                    self.flow._set_datastore(inputs[0])
+                    if input_paths:
+                        # initialize parameters (if they exist)
+                        # We take Parameter values from the first input,
+                        # which is always safe since parameters are read-only
+                        current._update_env(
+                            {
+                                "parameter_names": self._init_parameters(
+                                    inputs[0], passdown=False
+                                ),
+                                "graph_info": self.flow._graph_info,
+                            }
+                        )
+                for deco in decorators:
+                    deco.task_pre_step(
+                        step_name,
+                        output,
+                        self.metadata,
+                        run_id,
+                        task_id,
+                        self.flow,
+                        self.flow._graph,
+                        retry_count,
+                        max_user_code_retries,
+                        self.ubf_context,
+                        inputs,
                     )
-                ],
-            )
 
-            output.save_metadata({"task_end": {}})
-            output.persist(self.flow)
+                for deco in decorators:
+                    # decorators can actually decorate the step function,
+                    # or they can replace it altogether. This functionality
+                    # is used e.g. by catch_decorator which switches to a
+                    # fallback code if the user code has failed too many
+                    # times.
+                    step_func = deco.task_decorate(
+                        step_func,
+                        self.flow,
+                        self.flow._graph,
+                        retry_count,
+                        max_user_code_retries,
+                        self.ubf_context,
+                    )
 
-            # this writes a success marker indicating that the
-            # "transaction" is done
-            output.done()
+                if join_type:
+                    self._exec_step_function(step_func, input_obj)
+                else:
+                    self._exec_step_function(step_func)
 
-            # final decorator hook: The task results are now
-            # queryable through the client API / datastore
-            for deco in decorators:
-                deco.task_finished(
-                    step_name,
-                    self.flow,
-                    self.flow._graph,
-                    self.flow._task_ok,
-                    retry_count,
-                    max_user_code_retries,
+                for deco in decorators:
+                    deco.task_post_step(
+                        step_name,
+                        self.flow,
+                        self.flow._graph,
+                        retry_count,
+                        max_user_code_retries,
+                    )
+
+                self.flow._task_ok = True
+                self.flow._success = True
+
+            except Exception as ex:
+                with self.monitor.count("metaflow.task.exception"):
+                    _system_logger.log_event(
+                        level="error",
+                        module="metaflow.task",
+                        name="exception",
+                        payload={**task_payload, "msg": traceback.format_exc()},
+                    )
+
+                exception_handled = False
+                for deco in decorators:
+                    res = deco.task_exception(
+                        ex,
+                        step_name,
+                        self.flow,
+                        self.flow._graph,
+                        retry_count,
+                        max_user_code_retries,
+                    )
+                    exception_handled = bool(res) or exception_handled
+
+                if exception_handled:
+                    self.flow._task_ok = True
+                else:
+                    self.flow._task_ok = False
+                    self.flow._exception = MetaflowExceptionWrapper(ex)
+                    print("%s failed:" % self.flow, file=sys.stderr)
+                    raise
+
+            finally:
+                if self.ubf_context == UBF_CONTROL:
+                    self._finalize_control_task()
+
+                # Emit metrics to logger/monitor sidecar implementations
+                with self.monitor.count("metaflow.task.end"):
+                    _system_logger.log_event(
+                        level="info",
+                        module="metaflow.task",
+                        name="end",
+                        payload={**task_payload, "msg": "Task ended"},
+                    )
+                try:
+                    # persisting might fail due to unpicklable artifacts.
+                    output.persist(self.flow)
+                except Exception as ex:
+                    self.flow._task_ok = False
+                    raise ex
+                finally:
+                    # The attempt_ok metadata is used to determine task status so it is important
+                    # we ensure that it is written even in case of preceding failures.
+                    # f.ex. failing to serialize artifacts leads to a non-zero exit code for the process,
+                    # even if user code finishes successfully. Flow execution will not continue due to the exit,
+                    # so arguably we should mark the task as failed.
+                    attempt_ok = str(bool(self.flow._task_ok))
+                    self.metadata.register_metadata(
+                        run_id,
+                        step_name,
+                        task_id,
+                        [
+                            MetaDatum(
+                                field="attempt_ok",
+                                value=attempt_ok,
+                                type="internal_attempt_status",
+                                tags=["attempt_id:{0}".format(retry_count)],
+                            ),
+                        ],
+                    )
+
+                output.save_metadata({"task_end": {}})
+
+                # this writes a success marker indicating that the
+                # "transaction" is done
+                output.done()
+
+                # final decorator hook: The task results are now
+                # queryable through the client API / datastore
+                for deco in decorators:
+                    deco.task_finished(
+                        step_name,
+                        self.flow,
+                        self.flow._graph,
+                        self.flow._task_ok,
+                        retry_count,
+                        max_user_code_retries,
+                    )
+
+                # terminate side cars
+                self.metadata.stop_heartbeat()
+
+                # Task duration consists of the time taken to run the task as well as the time taken to
+                # persist the task metadata and data to the datastore.
+                duration = time.time() - start
+                _system_logger.log_event(
+                    level="info",
+                    module="metaflow.task",
+                    name="duration",
+                    payload={**task_payload, "msg": str(duration)},
                 )
-
-            # terminate side cars
-            self.metadata.stop_heartbeat()

@@ -4,6 +4,7 @@ import traceback
 from metaflow.exception import MetaflowException
 from metaflow.decorators import StepDecorator
 from metaflow.unbounded_foreach import UBF_CONTROL
+from metaflow.metaflow_config import DEFAULT_RUNTIME_LIMIT
 
 
 class TimeoutException(MetaflowException):
@@ -25,19 +26,19 @@ class TimeoutDecorator(StepDecorator):
 
     Parameters
     ----------
-    seconds : int, default: 0
+    seconds : int, default 0
         Number of seconds to wait prior to timing out.
-    minutes : int, default: 0
+    minutes : int, default 0
         Number of minutes to wait prior to timing out.
-    hours : int, default: 0
+    hours : int, default 0
         Number of hours to wait prior to timing out.
     """
 
     name = "timeout"
     defaults = {"seconds": 0, "minutes": 0, "hours": 0}
 
-    def __init__(self, *args, **kwargs):
-        super(TimeoutDecorator, self).__init__(*args, **kwargs)
+    def init(self):
+        super().init()
         # Initialize secs in __init__ so other decorators could safely use this
         # value without worrying about decorator order.
         # Convert values in attributes to type:int since they can be type:str
@@ -99,7 +100,7 @@ class TimeoutDecorator(StepDecorator):
 
 
 def get_run_time_limit_for_task(step_decos):
-    run_time_limit = 5 * 24 * 60 * 60  # 5 days.
+    run_time_limit = DEFAULT_RUNTIME_LIMIT
     for deco in step_decos:
         if isinstance(deco, TimeoutDecorator):
             run_time_limit = deco.secs

@@ -4,20 +4,26 @@ Local backend
 Execute the flow with a native runtime
 using local / remote processes
 """
+
 from __future__ import print_function
+import json
 import os
 import sys
 import fcntl
+import re
+import tempfile
 import time
 import subprocess
 from datetime import datetime
 from io import BytesIO
 from functools import partial
+from concurrent import futures
 
 from metaflow.datastore.exceptions import DataException
+from contextlib import contextmanager
 
 from . import get_namespace
-from .metadata import MetaDatum
+from .metadata_provider import MetaDatum
 from .metaflow_config import MAX_ATTEMPTS, UI_URL
 from .exception import (
     MetaflowException,
@@ -28,13 +34,19 @@ from . import procpoll
 from .datastore import TaskDataStoreSet
 from .debug import debug
 from .decorators import flow_decorators
+from .flowspec import _FlowState
 from .mflog import mflog, RUNTIME_LOG_SOURCE
 from .util import to_unicode, compress_list, unicode_type
+from .clone_util import clone_task_helper
 from .unbounded_foreach import (
     CONTROL_TASK_TAG,
     UBF_CONTROL,
     UBF_TASK,
 )
+
+from .user_configs.config_options import ConfigInput
+from .user_configs.config_parameters import dump_config_values
+
 import metaflow.tracing as tracing
 
 MAX_WORKERS = 16
@@ -45,7 +57,14 @@ PROGRESS_INTERVAL = 300  # s
 # The following is a list of the (data) artifacts used by the runtime while
 # executing a flow. These are prefetched during the resume operation by
 # leveraging the TaskDataStoreSet.
-PREFETCH_DATA_ARTIFACTS = ["_foreach_stack", "_task_ok", "_transition"]
+PREFETCH_DATA_ARTIFACTS = [
+    "_foreach_stack",
+    "_task_ok",
+    "_transition",
+    "_control_mapper_tasks",
+    "_control_task_is_mapper_zero",
+]
+RESUME_POLL_SECONDS = 60
 
 # Runtime must use logsource=RUNTIME_LOG_SOURCE for all loglines that it
 # formats according to mflog. See a comment in mflog.__init__
@@ -71,12 +90,12 @@ class NativeRuntime(object):
         clone_run_id=None,
         clone_only=False,
         reentrant=False,
-        clone_steps=None,
+        steps_to_rerun=None,
         max_workers=MAX_WORKERS,
         max_num_splits=MAX_NUM_SPLITS,
         max_log_size=MAX_LOG_SIZE,
+        resume_identifier=None,
     ):
-
         if run_id is None:
             self._run_id = metadata.new_run_id()
         else:
@@ -101,11 +120,24 @@ class NativeRuntime(object):
         self._entrypoint = entrypoint
         self.event_logger = event_logger
         self._monitor = monitor
+        self._resume_identifier = resume_identifier
 
         self._clone_run_id = clone_run_id
         self._clone_only = clone_only
-        self._clone_steps = {} if clone_steps is None else clone_steps
+        self._cloned_tasks = []
+        self._ran_or_scheduled_task_index = set()
         self._reentrant = reentrant
+        self._run_url = None
+
+        # If steps_to_rerun is specified, we will not clone them in resume mode.
+        self._steps_to_rerun = steps_to_rerun or {}
+        # sorted_nodes are in topological order already, so we only need to
+        # iterate through the nodes once to get a stable set of rerun steps.
+        for step_name in self._graph.sorted_nodes:
+            if step_name in self._steps_to_rerun:
+                out_funcs = self._graph[step_name].out_funcs or []
+                for next_step in out_funcs:
+                    self._steps_to_rerun.add(next_step)
 
         self._origin_ds_set = None
         if clone_run_id:
@@ -152,13 +184,12 @@ class NativeRuntime(object):
                 deco.runtime_init(flow, graph, package, self._run_id)
 
     def _new_task(self, step, input_paths=None, **kwargs):
-
         if input_paths is None:
             may_clone = True
         else:
             may_clone = all(self._is_cloned[path] for path in input_paths)
 
-        if step in self._clone_steps:
+        if step in self._steps_to_rerun:
             may_clone = False
 
         if step == "_parameters":
@@ -184,7 +215,8 @@ class NativeRuntime(object):
             origin_ds_set=self._origin_ds_set,
             decos=decos,
             logger=self._logger,
-            **kwargs
+            resume_identifier=self._resume_identifier,
+            **kwargs,
         )
 
     @property
@@ -192,25 +224,41 @@ class NativeRuntime(object):
         return self._run_id
 
     def persist_constants(self, task_id=None):
-        task = self._new_task("_parameters", task_id=task_id)
-        if not task.is_cloned:
-            task.persist(self._flow)
-        self._params_task = task.path
-        self._is_cloned[task.path] = task.is_cloned
+        self._params_task = self._new_task("_parameters", task_id=task_id)
+        if not self._params_task.is_cloned:
+            self._params_task.persist(self._flow)
 
-    def execute(self):
-        run_url = (
+        self._is_cloned[self._params_task.path] = self._params_task.is_cloned
+
+    def should_skip_clone_only_execution(self):
+        (
+            should_skip_clone_only_execution,
+            skip_reason,
+        ) = self._should_skip_clone_only_execution()
+        if should_skip_clone_only_execution:
+            self._logger(skip_reason, system_msg=True)
+            return True
+        return False
+
+    @contextmanager
+    def run_heartbeat(self):
+        self._metadata.start_run_heartbeat(self._flow.name, self._run_id)
+        yield
+        self._metadata.stop_heartbeat()
+
+    def print_workflow_info(self):
+        self._run_url = (
             "%s/%s/%s" % (UI_URL.rstrip("/"), self._flow.name, self._run_id)
             if UI_URL
             else None
         )
 
-        if run_url:
+        if self._run_url:
             self._logger(
                 "Workflow starting (run-id %s), see it in the UI at %s"
                 % (
                     self._run_id,
-                    run_url,
+                    self._run_url,
                 ),
                 system_msg=True,
             )
@@ -219,93 +267,314 @@ class NativeRuntime(object):
                 "Workflow starting (run-id %s):" % self._run_id, system_msg=True
             )
 
-        self._metadata.start_run_heartbeat(self._flow.name, self._run_id)
+    def _should_skip_clone_only_execution(self):
+        if self._clone_only and self._params_task:
+            if self._params_task.resume_done():
+                return True, "Resume already complete. Skip clone-only execution."
+            if not self._params_task.is_resume_leader():
+                return (
+                    True,
+                    "Not resume leader under resume execution. Skip clone-only execution.",
+                )
+        return False, None
 
-        if self._params_task:
-            self._queue_push("start", {"input_paths": [self._params_task]})
-        else:
-            self._queue_push("start", {})
-
-        progress_tstamp = time.time()
+    def clone_task(
+        self,
+        step_name,
+        task_id,
+        pathspec_index,
+        cloned_task_pathspec_index,
+        finished_tuple,
+        ubf_context,
+        generate_task_obj,
+        verbose=False,
+    ):
         try:
-            # main scheduling loop
-            exception = None
-            while self._run_queue or self._active_tasks[0] > 0:
+            new_task_id = task_id
+            if generate_task_obj:
+                task = self._new_task(step_name, pathspec_index=pathspec_index)
+                if ubf_context:
+                    task.ubf_context = ubf_context
+                new_task_id = task.task_id
+                self._cloned_tasks.append(task)
+                self._ran_or_scheduled_task_index.add(cloned_task_pathspec_index)
+                task_pathspec = "{}/{}/{}".format(self._run_id, step_name, new_task_id)
+            else:
+                task_pathspec = "{}/{}/{}".format(self._run_id, step_name, new_task_id)
+                Task.clone_pathspec_mapping[task_pathspec] = "{}/{}/{}".format(
+                    self._clone_run_id, step_name, task_id
+                )
+            if verbose:
+                self._logger(
+                    "Cloning task from {}/{}/{}/{} to {}/{}/{}/{}".format(
+                        self._flow.name,
+                        self._clone_run_id,
+                        step_name,
+                        task_id,
+                        self._flow.name,
+                        self._run_id,
+                        step_name,
+                        new_task_id,
+                    ),
+                    system_msg=True,
+                )
+            clone_task_helper(
+                self._flow.name,
+                self._clone_run_id,
+                self._run_id,
+                step_name,
+                task_id,  # origin_task_id
+                new_task_id,
+                self._flow_datastore,
+                self._metadata,
+                origin_ds_set=self._origin_ds_set,
+            )
+            self._finished[(step_name, finished_tuple)] = task_pathspec
+            self._is_cloned[task_pathspec] = True
+        except Exception as e:
+            self._logger(
+                "Cloning {}/{}/{}/{} failed with error: {}".format(
+                    self._flow.name, self._clone_run_id, step_name, task_id, str(e)
+                )
+            )
 
-                # 1. are any of the current workers finished?
-                finished_tasks = list(self._poll_workers())
-                # 2. push new tasks triggered by the finished tasks to the queue
-                self._queue_tasks(finished_tasks)
-                # 3. if there are available worker slots, pop and start tasks
-                #    from the queue.
-                self._launch_workers()
+    def clone_original_run(self, generate_task_obj=False, verbose=True):
+        self._logger(
+            "Cloning {}/{}".format(self._flow.name, self._clone_run_id),
+            system_msg=True,
+        )
 
-                if time.time() - progress_tstamp > PROGRESS_INTERVAL:
-                    progress_tstamp = time.time()
-                    tasks_print = ", ".join(
-                        [
-                            "%s (%d running; %d done)" % (k, v[0], v[1])
-                            for k, v in self._active_tasks.items()
-                            if k != 0 and v[0] > 0
-                        ]
+        inputs = []
+
+        ubf_mapper_tasks_to_clone = set()
+        ubf_control_tasks = set()
+        # We only clone ubf mapper tasks if the control task is complete.
+        # Here we need to check which control tasks are complete, and then get the corresponding
+        # mapper tasks.
+        for task_ds in self._origin_ds_set:
+            _, step_name, task_id = task_ds.pathspec.split("/")
+            pathspec_index = task_ds.pathspec_index
+            if task_ds["_task_ok"] and step_name != "_parameters":
+                # Control task contains "_control_mapper_tasks" but, in the case of
+                # @parallel decorator, the control task is also a mapper task so we
+                # need to distinguish this using _control_task_is_mapper_zero
+                control_mapper_tasks = (
+                    []
+                    if "_control_mapper_tasks" not in task_ds
+                    else task_ds["_control_mapper_tasks"]
+                )
+                if control_mapper_tasks:
+                    if task_ds.get("_control_task_is_mapper_zero", False):
+                        # Strip out the control task of list of mapper tasks
+                        ubf_control_tasks.add(control_mapper_tasks[0])
+                        ubf_mapper_tasks_to_clone.update(control_mapper_tasks[1:])
+                    else:
+                        ubf_mapper_tasks_to_clone.update(control_mapper_tasks)
+                        # Since we only add mapper tasks here, if we are not in the list
+                        # we are a control task
+                        if task_ds.pathspec not in ubf_mapper_tasks_to_clone:
+                            ubf_control_tasks.add(task_ds.pathspec)
+
+        for task_ds in self._origin_ds_set:
+            _, step_name, task_id = task_ds.pathspec.split("/")
+            pathspec_index = task_ds.pathspec_index
+
+            if (
+                task_ds["_task_ok"]
+                and step_name != "_parameters"
+                and (step_name not in self._steps_to_rerun)
+            ):
+                # "_unbounded_foreach" is a special flag to indicate that the transition
+                # is an unbounded foreach.
+                # Both parent and splitted children tasks will have this flag set.
+                # The splitted control/mapper tasks
+                # are not foreach types because UBF is always followed by a join step.
+                is_ubf_task = (
+                    "_unbounded_foreach" in task_ds and task_ds["_unbounded_foreach"]
+                ) and (self._graph[step_name].type != "foreach")
+
+                is_ubf_control_task = task_ds.pathspec in ubf_control_tasks
+
+                is_ubf_mapper_task = is_ubf_task and (not is_ubf_control_task)
+
+                if is_ubf_mapper_task and (
+                    task_ds.pathspec not in ubf_mapper_tasks_to_clone
+                ):
+                    # Skip copying UBF mapper tasks if control task is incomplete.
+                    continue
+
+                ubf_context = None
+                if is_ubf_task:
+                    ubf_context = "ubf_test" if is_ubf_mapper_task else "ubf_control"
+
+                finished_tuple = tuple(
+                    [s._replace(value=0) for s in task_ds.get("_foreach_stack", ())]
+                )
+                cloned_task_pathspec_index = pathspec_index.split("/")[1]
+                if task_ds.get("_control_task_is_mapper_zero", False):
+                    # Replace None with index 0 for control task as it is part of the
+                    # UBF (as a mapper as well)
+                    finished_tuple = finished_tuple[:-1] + (
+                        finished_tuple[-1]._replace(index=0),
                     )
-                    if self._active_tasks[0] == 0:
-                        msg = "No tasks are running."
+                    # We need this reverse override though because when we check
+                    # if a task has been cloned in _queue_push, the index will be None
+                    # because the _control_task_is_mapper_zero is set in the control
+                    # task *itself* and *not* in the one that is launching the UBF nest.
+                    # This means that _translate_index will use None.
+                    cloned_task_pathspec_index = re.sub(
+                        r"(\[(?:\d+, ?)*)0\]",
+                        lambda m: (m.group(1) or "[") + "None]",
+                        cloned_task_pathspec_index,
+                    )
+
+                inputs.append(
+                    (
+                        step_name,
+                        task_id,
+                        pathspec_index,
+                        cloned_task_pathspec_index,
+                        finished_tuple,
+                        is_ubf_mapper_task,
+                        ubf_context,
+                    )
+                )
+
+        with futures.ThreadPoolExecutor(max_workers=self._max_workers) as executor:
+            all_tasks = [
+                executor.submit(
+                    self.clone_task,
+                    step_name,
+                    task_id,
+                    pathspec_index,
+                    cloned_task_pathspec_index,
+                    finished_tuple,
+                    ubf_context=ubf_context,
+                    generate_task_obj=generate_task_obj and (not is_ubf_mapper_task),
+                    verbose=verbose,
+                )
+                for (
+                    step_name,
+                    task_id,
+                    pathspec_index,
+                    cloned_task_pathspec_index,
+                    finished_tuple,
+                    is_ubf_mapper_task,
+                    ubf_context,
+                ) in inputs
+            ]
+            _, _ = futures.wait(all_tasks)
+        self._logger(
+            "{}/{} cloned!".format(self._flow.name, self._clone_run_id), system_msg=True
+        )
+        self._params_task.mark_resume_done()
+
+    def execute(self):
+        if len(self._cloned_tasks) > 0:
+            # mutable list storing the cloned tasks.
+            self._run_queue = []
+            self._active_tasks[0] = 0
+        else:
+            if self._params_task:
+                self._queue_push("start", {"input_paths": [self._params_task.path]})
+            else:
+                self._queue_push("start", {})
+        progress_tstamp = time.time()
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as config_file:
+            # Configurations are passed through a file to avoid overloading the
+            # command-line. We only need to create this file once and it can be reused
+            # for any task launch
+            config_value = dump_config_values(self._flow)
+            if config_value:
+                json.dump(config_value, config_file)
+                config_file.flush()
+                self._config_file_name = config_file.name
+            else:
+                self._config_file_name = None
+            try:
+                # main scheduling loop
+                exception = None
+                while (
+                    self._run_queue or self._active_tasks[0] > 0 or self._cloned_tasks
+                ):
+                    # 1. are any of the current workers finished?
+                    if self._cloned_tasks:
+                        finished_tasks = self._cloned_tasks
+                        # reset the list of cloned tasks and let poll_workers handle
+                        # the remaining transition
+                        self._cloned_tasks = []
                     else:
-                        if self._active_tasks[0] == 1:
-                            msg = "1 task is running: "
-                        else:
-                            msg = "%d tasks are running: " % self._active_tasks[0]
-                        msg += "%s." % tasks_print
+                        finished_tasks = list(self._poll_workers())
+                    # 2. push new tasks triggered by the finished tasks to the queue
+                    self._queue_tasks(finished_tasks)
+                    # 3. if there are available worker slots, pop and start tasks
+                    #    from the queue.
+                    self._launch_workers()
 
-                    self._logger(msg, system_msg=True)
-
-                    if len(self._run_queue) == 0:
-                        msg = "No tasks are waiting in the queue."
-                    else:
-                        if len(self._run_queue) == 1:
-                            msg = "1 task is waiting in the queue: "
+                    if time.time() - progress_tstamp > PROGRESS_INTERVAL:
+                        progress_tstamp = time.time()
+                        tasks_print = ", ".join(
+                            [
+                                "%s (%d running; %d done)" % (k, v[0], v[1])
+                                for k, v in self._active_tasks.items()
+                                if k != 0 and v[0] > 0
+                            ]
+                        )
+                        if self._active_tasks[0] == 0:
+                            msg = "No tasks are running."
                         else:
-                            msg = "%d tasks are waiting in the queue." % len(
-                                self._run_queue
-                            )
+                            if self._active_tasks[0] == 1:
+                                msg = "1 task is running: "
+                            else:
+                                msg = "%d tasks are running: " % self._active_tasks[0]
+                            msg += "%s." % tasks_print
 
-                    self._logger(msg, system_msg=True)
-                    if len(self._unprocessed_steps) > 0:
-                        if len(self._unprocessed_steps) == 1:
-                            msg = "%s step has not started" % (
-                                next(iter(self._unprocessed_steps)),
-                            )
-                        else:
-                            msg = "%d steps have not started: " % len(
-                                self._unprocessed_steps
-                            )
-                            msg += "%s." % ", ".join(self._unprocessed_steps)
                         self._logger(msg, system_msg=True)
 
-        except KeyboardInterrupt as ex:
-            self._logger("Workflow interrupted.", system_msg=True, bad=True)
-            self._killall()
-            exception = ex
-            raise
-        except Exception as ex:
-            self._logger("Workflow failed.", system_msg=True, bad=True)
-            self._killall()
-            exception = ex
-            raise
-        finally:
-            # on finish clean tasks
-            for step in self._flow:
-                for deco in step.decorators:
-                    deco.runtime_finished(exception)
+                        if len(self._run_queue) == 0:
+                            msg = "No tasks are waiting in the queue."
+                        else:
+                            if len(self._run_queue) == 1:
+                                msg = "1 task is waiting in the queue: "
+                            else:
+                                msg = "%d tasks are waiting in the queue." % len(
+                                    self._run_queue
+                                )
 
-            self._metadata.stop_heartbeat()
+                        self._logger(msg, system_msg=True)
+                        if len(self._unprocessed_steps) > 0:
+                            if len(self._unprocessed_steps) == 1:
+                                msg = "%s step has not started" % (
+                                    next(iter(self._unprocessed_steps)),
+                                )
+                            else:
+                                msg = "%d steps have not started: " % len(
+                                    self._unprocessed_steps
+                                )
+                                msg += "%s." % ", ".join(self._unprocessed_steps)
+                            self._logger(msg, system_msg=True)
+
+            except KeyboardInterrupt as ex:
+                self._logger("Workflow interrupted.", system_msg=True, bad=True)
+                self._killall()
+                exception = ex
+                raise
+            except Exception as ex:
+                self._logger("Workflow failed.", system_msg=True, bad=True)
+                self._killall()
+                exception = ex
+                raise
+            finally:
+                # on finish clean tasks
+                for step in self._flow:
+                    for deco in step.decorators:
+                        deco.runtime_finished(exception)
 
         # assert that end was executed and it was successful
         if ("end", ()) in self._finished:
-            if run_url:
+            if self._run_url:
                 self._logger(
-                    "Done! See the run in the UI at %s" % run_url,
+                    "Done! See the run in the UI at %s" % self._run_url,
                     system_msg=True,
                 )
             else:
@@ -316,6 +585,7 @@ class NativeRuntime(object):
                 "cloned; no new tasks executed!",
                 system_msg=True,
             )
+            self._params_task.mark_resume_done()
         else:
             raise MetaflowInternalError(
                 "The *end* step was not successful by the end of flow."
@@ -349,9 +619,48 @@ class NativeRuntime(object):
         for _ in range(3):
             list(self._poll_workers())
 
+    # Given the current task information (task_index), the type of transition,
+    # and the split index, return the new task index.
+    def _translate_index(self, task, next_step, type, split_index=None):
+
+        match = re.match(r"^(.+)\[(.*)\]$", task.task_index)
+        if match:
+            _, foreach_index = match.groups()
+            # Convert foreach_index to a list of integers
+            if len(foreach_index) > 0:
+                foreach_index = foreach_index.split(",")
+            else:
+                foreach_index = []
+        else:
+            raise ValueError(
+                "Index not in the format of {run_id}/{step_name}[{foreach_index}]"
+            )
+        if type == "linear":
+            return "%s[%s]" % (next_step, ",".join(foreach_index))
+        elif type == "join":
+            indices = []
+            if len(foreach_index) > 0:
+                indices = foreach_index[:-1]
+            return "%s[%s]" % (next_step, ",".join(indices))
+        elif type == "split":
+            foreach_index.append(str(split_index))
+            return "%s[%s]" % (next_step, ",".join(foreach_index))
+
     # Store the parameters needed for task creation, so that pushing on items
     # onto the run_queue is an inexpensive operation.
-    def _queue_push(self, step, task_kwargs):
+    def _queue_push(self, step, task_kwargs, index=None):
+        # In the case of cloning, we set all the cloned tasks as the
+        # finished tasks when pushing tasks using _queue_tasks. This means that we
+        # could potentially try to push the same task multiple times (for example
+        # if multiple parents of a join are cloned). We therefore keep track of what
+        # has executed (been cloned) or what has been scheduled and avoid scheduling
+        # it again.
+        if index:
+            if index in self._ran_or_scheduled_task_index:
+                # It has already run or been scheduled
+                return
+            # Note that we are scheduling this to run
+            self._ran_or_scheduled_task_index.add(index)
         self._run_queue.insert(0, (step, task_kwargs))
         # For foreaches, this will happen multiple time but is ok, becomes a no-op
         self._unprocessed_steps.discard(step)
@@ -410,24 +719,16 @@ class NativeRuntime(object):
                     )
                 num_splits = len(mapper_tasks)
                 self._control_num_splits[task.path] = num_splits
-                if task.is_cloned:
-                    # Add mapper tasks to be cloned.
-                    for i in range(num_splits):
-                        # NOTE: For improved robustness, introduce
-                        # `clone_options` as an enum so that we can force that
-                        # clone must occur for this task.
-                        self._queue_push(
-                            task.step,
-                            {
-                                "input_paths": task.input_paths,
-                                "split_index": str(i),
-                                "ubf_context": UBF_TASK,
-                            },
-                        )
-                else:
-                    # Update _finished since these tasks were successfully
-                    # run elsewhere so that join will be unblocked.
-                    step_name, foreach_stack = task.finished_id
+
+                # If the control task is cloned, all mapper tasks should have been cloned
+                # as well, so we no longer need to handle cloning of mapper tasks in runtime.
+
+                # Update _finished if we are not cloned. If we were cloned, we already
+                # updated _finished with the new tasks. Note that the *value* of mapper
+                # tasks is incorrect and contains the pathspec of the *cloned* run
+                # but we don't use it for anything. We could look to clean it up though
+                if not task.is_cloned:
+                    _, foreach_stack = task.finished_id
                     top = foreach_stack[-1]
                     bottom = list(foreach_stack[:-1])
                     for i in range(num_splits):
@@ -437,7 +738,7 @@ class NativeRuntime(object):
 
             # Find and check status of control task and retrieve its pathspec
             # for retrieving unbounded foreach cardinality.
-            step_name, foreach_stack = task.finished_id
+            _, foreach_stack = task.finished_id
             top = foreach_stack[-1]
             bottom = list(foreach_stack[:-1])
             s = tuple(bottom + [top._replace(index=None)])
@@ -458,16 +759,18 @@ class NativeRuntime(object):
                     required_tasks.append(self._finished.get((task.step, s)))
 
                 if all(required_tasks):
+                    index = self._translate_index(task, next_step, "join")
                     # all tasks to be joined are ready. Schedule the next join step.
                     self._queue_push(
                         next_step,
                         {"input_paths": required_tasks, "join_type": "foreach"},
+                        index,
                     )
         else:
             # matching_split is the split-parent of the finished task
             matching_split = self._graph[self._graph[next_step].split_parents[-1]]
-            step_name, foreach_stack = task.finished_id
-
+            _, foreach_stack = task.finished_id
+            index = ""
             if matching_split.type == "foreach":
                 # next step is a foreach join
 
@@ -482,6 +785,7 @@ class NativeRuntime(object):
                     self._finished.get((task.step, s)) for s in siblings(foreach_stack)
                 ]
                 join_type = "foreach"
+                index = self._translate_index(task, next_step, "join")
             else:
                 # next step is a split
                 # required tasks are all branches joined by the next step
@@ -490,15 +794,17 @@ class NativeRuntime(object):
                     for step in self._graph[next_step].in_funcs
                 ]
                 join_type = "linear"
+                index = self._translate_index(task, next_step, "linear")
 
             if all(required_tasks):
                 # all tasks to be joined are ready. Schedule the next join step.
                 self._queue_push(
-                    next_step, {"input_paths": required_tasks, "join_type": join_type}
+                    next_step,
+                    {"input_paths": required_tasks, "join_type": join_type},
+                    index,
                 )
 
     def _queue_task_foreach(self, task, next_steps):
-
         # CHECK: this condition should be enforced by the linter but
         # let's assert that the assumption holds
         if len(next_steps) > 1:
@@ -516,6 +822,12 @@ class NativeRuntime(object):
             # Need to push control process related task.
             ubf_iter_name = task.results.get("_foreach_var")
             ubf_iter = task.results.get(ubf_iter_name)
+            # UBF control task has no split index, hence "None" as place holder.
+
+            if task.results.get("_control_task_is_mapper_zero", False):
+                index = self._translate_index(task, next_step, "split", 0)
+            else:
+                index = self._translate_index(task, next_step, "split", None)
             self._queue_push(
                 next_step,
                 {
@@ -523,6 +835,7 @@ class NativeRuntime(object):
                     "ubf_context": UBF_CONTROL,
                     "ubf_iter": ubf_iter,
                 },
+                index,
             )
         else:
             num_splits = task.results["_foreach_num_splits"]
@@ -542,8 +855,11 @@ class NativeRuntime(object):
 
             # schedule all splits
             for i in range(num_splits):
+                index = self._translate_index(task, next_step, "split", i)
                 self._queue_push(
-                    next_step, {"split_index": str(i), "input_paths": [task.path]}
+                    next_step,
+                    {"split_index": str(i), "input_paths": [task.path]},
+                    index,
                 )
 
     def _queue_tasks(self, finished_tasks):
@@ -591,7 +907,8 @@ class NativeRuntime(object):
             else:
                 # Next steps are normal linear steps
                 for step in next_steps:
-                    self._queue_push(step, {"input_paths": [task.path]})
+                    index = self._translate_index(task, step, "linear")
+                    self._queue_push(step, {"input_paths": [task.path]}, index)
 
     def _poll_workers(self):
         if self._workers:
@@ -670,7 +987,7 @@ class NativeRuntime(object):
             )
             return
 
-        worker = Worker(task, self._max_log_size)
+        worker = Worker(task, self._max_log_size, self._config_file_name)
         for fd in worker.fds():
             self._workers[fd] = worker
             self._poll.add(fd)
@@ -711,9 +1028,11 @@ class Task(object):
         ubf_iter=None,
         join_type=None,
         task_id=None,
+        resume_identifier=None,
+        pathspec_index=None,
     ):
-
         self.step = step
+        self.flow = flow
         self.flow_name = flow.name
         self.run_id = run_id
         self.task_id = None
@@ -749,32 +1068,37 @@ class Task(object):
         self.datastore_sysroot = flow_datastore.datastore_root
         self._results_ds = None
 
+        # Only used in clone-only resume.
+        self._is_resume_leader = None
+        self._resume_done = None
+        self._resume_identifier = resume_identifier
         origin = None
         if clone_run_id and may_clone:
-            origin = self._find_origin_task(clone_run_id, join_type)
+            origin = self._find_origin_task(clone_run_id, join_type, pathspec_index)
         if origin and origin["_task_ok"]:
             # At this point, we know we are going to clone
             self._is_cloned = True
+
+            task_id_exists_already = False
+            task_completed = False
             if reentrant:
                 # A re-entrant clone basically allows multiple concurrent processes
                 # to perform the clone at the same time to the same new run id. Let's
                 # assume two processes A and B both simultaneously calling
                 # `resume --reentrant --run-id XX`.
-                # For each task that is cloned, we want to guarantee that:
-                #   - one and only one of A or B will do the actual cloning
-                #   - the other process (or other processes) will block until the cloning
-                #     is complete.
-                # This ensures that the rest of the clone algorithm can proceed as normal
-                # and also guarantees that we only write once to the datastore and
-                # metadata.
+                # We want to guarantee that:
+                #   - All incomplete tasks are cloned exactly once.
+                # To achieve this, we will select a resume leader and let it clone the
+                # entire execution graph. This ensures that we only write once to the
+                # datastore and metadata.
                 #
-                # To accomplish this, we use the cloned task's task-id as the "key" to
-                # synchronize on. We then try to "register" this new task-id (or rather
-                # the full pathspec <run>/<step>/<taskid>) with the metadata service
-                # which will indicate if we actually registered it or if it existed
-                # already. If we did manage to register it, we are the "elected cloner"
+                # We use the cloned _parameter task's task-id as the "key" to synchronize
+                # on. We try to "register" this new task-id (or rather the full pathspec
+                # <run>/<step>/<taskid>) with the metadata service which will indicate
+                # if we actually registered it or if it existed already. If we did manage
+                # to register it (_parameter task), we are the "elected resume leader"
                 # in essence and proceed to clone. If we didn't, we just wait to make
-                # sure the task is fully done (ie: the clone is finished).
+                # sure the entire clone execution is fully done (ie: the clone is finished).
                 if task_id is not None:
                     # Sanity check -- this should never happen. We cannot allow
                     # for explicit task-ids because in the reentrant case, we use the
@@ -783,6 +1107,15 @@ class Task(object):
                         "Reentrant clone-only resume does not allow for explicit task-id"
                     )
 
+                if resume_identifier:
+                    self.log(
+                        "Resume identifier is %s." % resume_identifier,
+                        system_msg=True,
+                    )
+                else:
+                    raise MetaflowInternalError(
+                        "Reentrant clone-only resume needs a resume identifier."
+                    )
                 # We will use the same task_id as the original task
                 # to use it effectively as a synchronization key
                 clone_task_id = origin.task_id
@@ -798,62 +1131,130 @@ class Task(object):
 
                 # If _get_task_id returns True it means the task already existed, so
                 # we wait for it.
-                self._wait_for_clone = self._get_task_id(clone_task_id)
+                task_id_exists_already = self._get_task_id(clone_task_id)
+
+                # We may not have access to task datastore on first resume attempt, but
+                # on later resume attempt, we should check if the resume task is complete
+                # or not. This is to fix the issue where the resume leader was killed
+                # unexpectedly during cloning and never mark task complete.
+                try:
+                    task_completed = self.results["_task_ok"]
+                except DataException as e:
+                    pass
             else:
-                self._wait_for_clone = False
                 self._get_task_id(task_id)
 
             # Store the mapping from current_pathspec -> origin_pathspec which
             # will be useful for looking up origin_ds_set in find_origin_task.
             self.clone_pathspec_mapping[self._path] = origin.pathspec
             if self.step == "_parameters":
-                # We don't put _parameters on the queue so we either clone it or wait
-                # for it.
-                if not self._wait_for_clone:
+                # In the _parameters task, we need to resolve who is the resume leader.
+                self._is_resume_leader = False
+                resume_leader = None
+
+                if task_id_exists_already:
+                    # If the task id already exists, we need to check if current task is the resume leader in previous attempt.
+                    ds = self._flow_datastore.get_task_datastore(
+                        self.run_id, self.step, self.task_id
+                    )
+                    if not ds["_task_ok"]:
+                        raise MetaflowInternalError(
+                            "Externally cloned _parameters task did not succeed"
+                        )
+
+                    # Check if we should be the resume leader (maybe from previous attempt).
+                    # To avoid the edge case where the resume leader is selected but has not
+                    # yet written the _resume_leader metadata, we will wait for a few seconds.
+                    # We will wait for resume leader for at most 3 times.
+                    for _ in range(3):
+                        if ds.has_metadata("_resume_leader", add_attempt=False):
+                            resume_leader = ds.load_metadata(
+                                ["_resume_leader"], add_attempt=False
+                            )["_resume_leader"]
+                            self._is_resume_leader = resume_leader == resume_identifier
+                        else:
+                            self.log(
+                                "Waiting for resume leader to be selected. Sleeping ...",
+                                system_msg=True,
+                            )
+                            time.sleep(3)
+                else:
+                    # If the task id does not exist, current task is the resume leader.
+                    resume_leader = resume_identifier
+                    self._is_resume_leader = True
+
+                if reentrant:
+                    if resume_leader:
+                        self.log(
+                            "Resume leader is %s." % resume_leader,
+                            system_msg=True,
+                        )
+                    else:
+                        raise MetaflowInternalError(
+                            "Can not determine the resume leader in distributed resume mode."
+                        )
+
+                if self._is_resume_leader:
+                    if reentrant:
+                        self.log(
+                            "Selected as the reentrant clone leader.",
+                            system_msg=True,
+                        )
                     # Clone in place without relying on run_queue.
                     self.new_attempt()
                     self._ds.clone(origin)
+                    # Set the resume leader be the task that calls the resume (first task to clone _parameters task).
+                    # We will always set resume leader regardless whether we are in distributed resume case or not.
+                    if resume_identifier:
+                        self._ds.save_metadata(
+                            {"_resume_leader": resume_identifier}, add_attempt=False
+                        )
+
                     self._ds.done()
                 else:
-                    # TODO: There is a bit of a duplication with the task.py
-                    # clone_only function here
-                    self.log(
-                        "Waiting for clone of _parameters step to occur...",
-                        system_msg=True,
-                    )
+                    # Wait for the resume leader to complete
                     while True:
-                        try:
-                            ds = self._flow_datastore.get_task_datastore(
-                                self.run_id, self.step, self.task_id
-                            )
-                            if not ds["_task_ok"]:
-                                raise MetaflowInternalError(
-                                    "Externally cloned _parameters task did not succeed"
-                                )
+                        ds = self._flow_datastore.get_task_datastore(
+                            self.run_id, self.step, self.task_id
+                        )
+
+                        # Check if resume is complete. Resume leader will write the done file.
+                        self._resume_done = ds.has_metadata(
+                            "_resume_done", add_attempt=False
+                        )
+
+                        if self._resume_done:
                             break
-                        except DataException:
-                            self.log("Sleeping for 5s...", system_msg=True)
-                            # No need to get fancy with the sleep here.
-                            time.sleep(5)
-                    self.log("_parameters clone successful", system_msg=True)
+
+                        self.log(
+                            "Waiting for resume leader to complete. Sleeping for %ds..."
+                            % RESUME_POLL_SECONDS,
+                            system_msg=True,
+                        )
+                        time.sleep(RESUME_POLL_SECONDS)
+                    self.log(
+                        "_parameters clone completed by resume leader", system_msg=True
+                    )
             else:
-                # For non parameter steps
+                # Only leader can reach non-parameter steps in resume.
+
                 # Store the origin pathspec in clone_origin so this can be run
                 # as a task by the runtime.
                 self.clone_origin = origin.pathspec
                 # Save a call to creating the results_ds since its same as origin.
                 self._results_ds = origin
-                if self._wait_for_clone:
+
+                # If the task is already completed in new run, we don't need to clone it.
+                self._should_skip_cloning = task_completed
+                if self._should_skip_cloning:
                     self.log(
-                        "Waiting for the successful cloning of results "
-                        "of a previously run task %s (this may take some time)"
+                        "Skipping cloning of previously run task %s"
                         % self.clone_origin,
                         system_msg=True,
                     )
                 else:
                     self.log(
-                        "Cloning results of a previously run task %s"
-                        % self.clone_origin,
+                        "Cloning previously run task %s" % self.clone_origin,
                         system_msg=True,
                     )
         else:
@@ -866,7 +1267,6 @@ class Task(object):
         # Open the output datastore only if the task is not being cloned.
         if not self._is_cloned:
             self.new_attempt()
-
             for deco in decos:
                 deco.runtime_task_created(
                     self._ds,
@@ -916,65 +1316,61 @@ class Task(object):
         self._logger(msg, head=prefix, system_msg=system_msg, timestamp=timestamp)
         sys.stdout.flush()
 
+    def is_resume_leader(self):
+        assert (
+            self.step == "_parameters"
+        ), "Only _parameters step can check resume leader."
+        return self._is_resume_leader
+
+    def resume_done(self):
+        assert (
+            self.step == "_parameters"
+        ), "Only _parameters step can check wheather resume is complete."
+        return self._resume_done
+
+    def mark_resume_done(self):
+        assert (
+            self.step == "_parameters"
+        ), "Only _parameters step can mark resume as done."
+        assert self.is_resume_leader(), "Only resume leader can mark resume as done."
+
+        # Mark the resume as done. This is called at the end of the resume flow and after
+        # the _parameters step was successfully cloned, so we need to 'dangerously' save
+        # this done file, but the risk should be minimal.
+        self._ds._dangerous_save_metadata_post_done(
+            {"_resume_done": True}, add_attempt=False
+        )
+
     def _get_task_id(self, task_id):
         already_existed = True
+        tags = []
         if self.ubf_context == UBF_CONTROL:
-            [input_path] = self.input_paths
-            run, input_step, input_task = input_path.split("/")
-            # We associate the control task-id to be 1:1 with the split node
-            # where the unbounded-foreach was defined.
-            # We prefer encoding the corresponding split into the task_id of
-            # the control node; so it has access to this information quite
-            # easily. There is anyway a corresponding int id stored in the
-            # metadata backend - so this should be fine.
-            task_id = "control-%s-%s-%s" % (run, input_step, input_task)
-        # Register only regular Metaflow (non control) tasks.
+            tags = [CONTROL_TASK_TAG]
+        # Register Metaflow tasks.
         if task_id is None:
-            task_id = str(self.metadata.new_task_id(self.run_id, self.step))
+            task_id = str(
+                self.metadata.new_task_id(self.run_id, self.step, sys_tags=tags)
+            )
             already_existed = False
         else:
-            # task_id is preset only by persist_constants() or control tasks.
-            if self.ubf_context == UBF_CONTROL:
-                tags = [CONTROL_TASK_TAG]
-                attempt_id = 0
-                already_existed = not self.metadata.register_task_id(
-                    self.run_id,
-                    self.step,
-                    task_id,
-                    attempt_id,
-                    sys_tags=tags,
-                )
-                # A Task's tags are now those of its ancestral Run, so we are not able
-                # to rely on a task's tags to indicate the presence of a control task
-                # so, on top of adding the tags above, we also add a task metadata
-                # entry indicating that this is a "control task".
-                #
-                # Here we will also add a task metadata entry to indicate "control task".
-                # Within the metaflow repo, the only dependency of such a "control task"
-                # indicator is in the integration test suite (see Step.control_tasks() in
-                # client API).
-                task_metadata_list = [
-                    MetaDatum(
-                        field="internal_task_type",
-                        value=CONTROL_TASK_TAG,
-                        type="internal_task_type",
-                        tags=["attempt_id:{0}".format(attempt_id)],
-                    )
-                ]
-                self.metadata.register_metadata(
-                    self.run_id, self.step, task_id, task_metadata_list
-                )
-            else:
-                already_existed = not self.metadata.register_task_id(
-                    self.run_id, self.step, task_id, 0
-                )
+            # task_id is preset only by persist_constants().
+            already_existed = not self.metadata.register_task_id(
+                self.run_id,
+                self.step,
+                task_id,
+                0,
+                sys_tags=tags,
+            )
 
         self.task_id = task_id
         self._path = "%s/%s/%s" % (self.run_id, self.step, self.task_id)
         return already_existed
 
-    def _find_origin_task(self, clone_run_id, join_type):
-        if self.step == "_parameters":
+    def _find_origin_task(self, clone_run_id, join_type, pathspec_index=None):
+        if pathspec_index:
+            origin = self.origin_ds_set.get_with_pathspec_index(pathspec_index)
+            return origin
+        elif self.step == "_parameters":
             pathspec = "%s/_parameters[]" % clone_run_id
             origin = self.origin_ds_set.get_with_pathspec_index(pathspec)
 
@@ -1025,17 +1421,28 @@ class Task(object):
             return self._results_ds
 
     @property
+    def task_index(self):
+        _, task_index = self.results.pathspec_index.split("/")
+        return task_index
+
+    @property
     def finished_id(self):
-        # note: id is not available before the task has finished
-        return (self.step, tuple(self.results["_foreach_stack"]))
+        # note: id is not available before the task has finished.
+        # Index already identifies the task within the foreach,
+        # we will remove foreach value so that it is easier to
+        # identify siblings within a foreach.
+        foreach_stack_tuple = tuple(
+            [s._replace(value=0) for s in self.results["_foreach_stack"]]
+        )
+        return (self.step, foreach_stack_tuple)
 
     @property
     def is_cloned(self):
         return self._is_cloned
 
     @property
-    def wait_for_clone(self):
-        return self._wait_for_clone
+    def should_skip_cloning(self):
+        return self._should_skip_cloning
 
     def persist(self, flow):
         # this is used to persist parameters before the start step
@@ -1123,8 +1530,17 @@ class CLIArgs(object):
         # FlowDecorators can define their own top-level options. They are
         # responsible for adding their own top-level options and values through
         # the get_top_level_options() hook.
-        for deco in flow_decorators():
+        for deco in flow_decorators(self.task.flow):
             self.top_level_options.update(deco.get_top_level_options())
+
+        # We also pass configuration options using the kv.<name> syntax which will cause
+        # the configuration options to be loaded from the CONFIG file (or local-config-file
+        # in the case of the local runtime)
+        configs = self.task.flow._flow_state.get(_FlowState.CONFIGS)
+        if configs:
+            self.top_level_options["config-value"] = [
+                (k, ConfigInput.make_key_name(k)) for k in configs
+            ]
 
         self.commands = ["step"]
         self.command_args = [self.task.step]
@@ -1142,11 +1558,9 @@ class CLIArgs(object):
         self.env = {}
 
     def get_args(self):
-
         # TODO: Make one with dict_to_cli_options; see cli_args.py for more detail
         def _options(mapping):
             for k, v in mapping.items():
-
                 # None or False arguments are ignored
                 # v needs to be explicitly False, not falsy, e.g. 0 is an acceptable value
                 if v is None or v is False:
@@ -1161,12 +1575,15 @@ class CLIArgs(object):
                 for value in v:
                     yield "--%s" % k
                     if not isinstance(value, bool):
-                        yield to_unicode(value)
+                        value = value if isinstance(value, tuple) else (value,)
+                        for vv in value:
+                            yield to_unicode(vv)
 
         args = list(self.entrypoint)
         args.extend(_options(self.top_level_options))
         args.extend(self.commands)
         args.extend(self.command_args)
+
         args.extend(_options(self.command_options))
         return args
 
@@ -1178,9 +1595,9 @@ class CLIArgs(object):
 
 
 class Worker(object):
-    def __init__(self, task, max_logs_size):
-
+    def __init__(self, task, max_logs_size, config_file_name):
         self.task = task
+        self._config_file_name = config_file_name
         self._proc = self._launch()
 
         if task.retries > task.user_code_retries:
@@ -1223,8 +1640,6 @@ class Worker(object):
             # disabling sidecars for cloned tasks due to perf reasons
             args.top_level_options["event-logger"] = "nullSidecarLogger"
             args.top_level_options["monitor"] = "nullSidecarMonitor"
-            if self.task.wait_for_clone:
-                args.command_options["clone-wait-only"] = True
         else:
             # decorators may modify the CLIArgs object in-place
             for deco in self.task.decos:
@@ -1234,6 +1649,12 @@ class Worker(object):
                     self.task.user_code_retries,
                     self.task.ubf_context,
                 )
+
+        # Add user configurations using a file to avoid using up too much space on the
+        # command line
+        if self._config_file_name:
+            args.top_level_options["local-config-file"] = self._config_file_name
+        # Pass configuration options
         env.update(args.get_env())
         env["PYTHONUNBUFFERED"] = "x"
         tracing.inject_tracing_vars(env)

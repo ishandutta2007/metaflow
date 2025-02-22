@@ -9,8 +9,6 @@ from metaflow.extension_support import dump_module_info
 from metaflow.mflog import BASH_MFLOG
 from . import R
 
-version_cache = None
-
 
 class InvalidEnvironmentException(MetaflowException):
     headline = "Incompatible environment"
@@ -89,10 +87,18 @@ class MetaflowEnvironment(object):
         It should work silently if everything goes well.
         """
         if datastore_type == "s3":
-            return (
-                '%s -m awscli ${METAFLOW_S3_ENDPOINT_URL:+--endpoint-url=\\"${METAFLOW_S3_ENDPOINT_URL}\\"} '
-                + "s3 cp %s job.tar >/dev/null"
-            ) % (self._python(), code_package_url)
+            from .plugins.aws.aws_utils import parse_s3_full_path
+
+            bucket, s3_object = parse_s3_full_path(code_package_url)
+            # NOTE: the script quoting is extremely sensitive due to the way shlex.split operates and this being inserted
+            # into a quoted command elsewhere.
+            # NOTE: Reason for the extra conditionals in the script are because
+            # Boto3 does not play well with passing None or an empty string to endpoint_url
+            return "{python} -c '{script}'".format(
+                python=self._python(),
+                script='import boto3, os; ep=os.getenv(\\"METAFLOW_S3_ENDPOINT_URL\\"); boto3.client(\\"s3\\", **({\\"endpoint_url\\":ep} if ep else {})).download_file(\\"%s\\", \\"%s\\", \\"job.tar\\")'
+                % (bucket, s3_object),
+            )
         elif datastore_type == "azure":
             from .plugins.azure.azure_utils import parse_azure_full_path
 
@@ -119,25 +125,36 @@ class MetaflowEnvironment(object):
             )
 
     def _get_install_dependencies_cmd(self, datastore_type):
-        cmds = ["%s -m pip install requests -qqq" % self._python()]
-        if datastore_type == "s3":
-            cmds.append("%s -m pip install awscli boto3 -qqq" % self._python())
-        elif datastore_type == "azure":
-            cmds.append(
-                "%s -m pip install azure-identity azure-storage-blob simple-azure-blob-downloader -qqq"
-                % self._python()
-            )
-        elif datastore_type == "gs":
-            cmds.append(
-                "%s -m pip install google-cloud-storage google-auth simple-gcp-object-downloader -qqq"
-                % self._python()
-            )
-        else:
+        base_cmd = "{} -m pip install -qqq --no-compile --no-cache-dir --disable-pip-version-check".format(
+            self._python()
+        )
+
+        datastore_packages = {
+            "s3": ["boto3"],
+            "azure": [
+                "azure-identity",
+                "azure-storage-blob",
+                "azure-keyvault-secrets",
+                "simple-azure-blob-downloader",
+            ],
+            "gs": [
+                "google-cloud-storage",
+                "google-auth",
+                "simple-gcp-object-downloader",
+                "google-cloud-secret-manager",
+            ],
+        }
+
+        if datastore_type not in datastore_packages:
             raise NotImplementedError(
-                "We don't know how to generate an install dependencies cmd for datastore %s"
-                % datastore_type
+                "Unknown datastore type: {}".format(datastore_type)
             )
-        return " && ".join(cmds)
+
+        cmd = "{} {}".format(
+            base_cmd, " ".join(datastore_packages[datastore_type] + ["requests"])
+        )
+        # skip pip installs if we know that packages might already be available
+        return "if [ -z $METAFLOW_SKIP_INSTALL_DEPENDENCIES ]; then {}; fi".format(cmd)
 
     def get_package_commands(self, code_package_url, datastore_type):
         cmds = [
@@ -163,10 +180,6 @@ class MetaflowEnvironment(object):
         return cmds
 
     def get_environment_info(self, include_ext_info=False):
-        global version_cache
-        if version_cache is None:
-            version_cache = metaflow_version.get_version()
-
         # note that this dict goes into the code package
         # so variables here should be relatively stable (no
         # timestamps) so the hash won't change all the time
@@ -180,7 +193,7 @@ class MetaflowEnvironment(object):
             "use_r": R.use_r(),
             "python_version": sys.version,
             "python_version_code": "%d.%d.%d" % sys.version_info[:3],
-            "metaflow_version": version_cache,
+            "metaflow_version": metaflow_version.get_version(),
             "script": os.path.basename(os.path.abspath(sys.argv[0])),
         }
         if R.use_r():

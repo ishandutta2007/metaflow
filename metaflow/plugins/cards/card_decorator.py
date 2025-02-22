@@ -1,21 +1,19 @@
-import subprocess
-import os
-import tempfile
-import sys
 import json
-
-from typing import Dict, Any
-
-from metaflow.decorators import StepDecorator, flow_decorators
-from metaflow.current import current
-from metaflow.util import to_unicode
-from .component_serializer import CardComponentCollector, get_card_class
-
-
-# from metaflow import get_metadata
+import os
 import re
+import tempfile
 
+from metaflow.decorators import StepDecorator
+from metaflow.metaflow_current import current
+from metaflow.user_configs.config_options import ConfigInput
+from metaflow.user_configs.config_parameters import dump_config_values
+from metaflow.util import to_unicode
+
+from .component_serializer import CardComponentCollector, get_card_class
+from .card_creator import CardCreator
 from .exception import CARD_ID_PATTERN, TYPE_CHECK_REGEX
+
+ASYNC_TIMEOUT = 30
 
 
 def warning_message(message, logger=None, ts=False):
@@ -32,14 +30,29 @@ class CardDecorator(StepDecorator):
 
     Parameters
     ----------
-    type : str, default: 'default'
+    type : str, default 'default'
         Card type.
-    id : str, optional, default: None
+    id : str, optional, default None
         If multiple cards are present, use this id to identify this card.
-    options : Dict[str, Any], default: {}
+    options : Dict[str, Any], default {}
         Options passed to the card. The contents depend on the card type.
-    timeout : int, default: 45
+    timeout : int, default 45
         Interrupt reporting if it takes more than this many seconds.
+
+    MF Add To Current
+    -----------------
+    card -> metaflow.plugins.cards.component_serializer.CardComponentCollector
+        The `@card` decorator makes the cards available through the `current.card`
+        object. If multiple `@card` decorators are present, you can add an `ID` to
+        distinguish between them using `@card(id=ID)` as the decorator. You will then
+        be able to access that specific card using `current.card[ID].
+
+        Methods available are `append` and `extend`
+
+        @@ Returns
+        -------
+        CardComponentCollector
+            The or one of the cards attached to this step.
     """
 
     name = "card"
@@ -51,6 +64,7 @@ class CardDecorator(StepDecorator):
         "id": None,
         "save_errors": True,
         "customize": False,
+        "refresh_interval": 5,
     }
     allow_multiple = True
 
@@ -59,6 +73,14 @@ class CardDecorator(StepDecorator):
     step_counter = 0
 
     _called_once = {}
+
+    card_creator = None
+
+    _config_values = None
+
+    _config_file_name = None
+
+    task_finished_decos = 0
 
     def __init__(self, *args, **kwargs):
         super(CardDecorator, self).__init__(*args, **kwargs)
@@ -69,6 +91,10 @@ class CardDecorator(StepDecorator):
         self._is_editable = False
         self._card_uuid = None
         self._user_set_card_id = None
+
+    @classmethod
+    def _set_card_creator(cls, card_creator):
+        cls.card_creator = card_creator
 
     def _is_event_registered(self, evt_name):
         return evt_name in self._called_once
@@ -86,14 +112,42 @@ class CardDecorator(StepDecorator):
     def _increment_step_counter(cls):
         cls.step_counter += 1
 
+    @classmethod
+    def _increment_completed_counter(cls):
+        cls.task_finished_decos += 1
+
+    @classmethod
+    def _set_config_values(cls, config_values):
+        cls._config_values = config_values
+
+    @classmethod
+    def _set_config_file_name(cls, flow):
+        # Only create a config file from the very first card decorator.
+        if cls._config_values and not cls._config_file_name:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", delete=False
+            ) as config_file:
+                config_value = dump_config_values(flow)
+                json.dump(config_value, config_file)
+                cls._config_file_name = config_file.name
+
     def step_init(
         self, flow, graph, step_name, decorators, environment, flow_datastore, logger
     ):
-
         self._flow_datastore = flow_datastore
         self._environment = environment
         self._logger = logger
         self.card_options = None
+
+        # We check for configuration options. We do this here before they are
+        # converted to properties.
+        self._set_config_values(
+            [
+                (config.name, ConfigInput.make_key_name(config.name))
+                for _, config in flow._get_parameters()
+                if config.IS_CONFIG_PARAMETER
+            ]
+        )
 
         self.card_options = self.attributes["options"]
 
@@ -101,6 +155,7 @@ class CardDecorator(StepDecorator):
         # `'%s-%s'%(evt_name,step_name)` ensures that we capture this once per @card per @step.
         # Since there can be many steps checking if event is registered for `evt_name` will only make it check it once for all steps.
         # Hence, we have `_is_event_registered('%s-%s'%(evt_name,step_name))`
+        self._is_runtime_card = False
         evt = "%s-%s" % (evt_name, step_name)
         if not self._is_event_registered(evt):
             # We set the total count of decorators so that we can use it for
@@ -126,11 +181,26 @@ class CardDecorator(StepDecorator):
         ubf_context,
         inputs,
     ):
+        self._task_datastore = task_datastore
+        self._metadata = metadata
+
+        # If we have configs, we need to dump them to a file so we can re-use them
+        # when calling the card creation subprocess.
+        # Since a step can contain multiple card decorators, and all the card creation processes
+        # will reference the same config file (because of how the CardCreator is created (only single class instance)),
+        # we need to ensure that a single config file is being referenced for all card create commands.
+        # This config file will be removed when the last card decorator has finished creating its card.
+        self._set_config_file_name(flow)
+
         card_type = self.attributes["type"]
         card_class = get_card_class(card_type)
+
+        self._is_runtime_card = False
         if card_class is not None:  # Card type was not found
             if card_class.ALLOW_USER_COMPONENTS:
                 self._is_editable = True
+            self._is_runtime_card = card_class.RUNTIME_UPDATABLE
+
         # We have a step counter to ensure that on calling the final card decorator's `task_pre_step`
         # we call a `finalize` function in the `CardComponentCollector`.
         # This can help ensure the behaviour of the `current.card` object is according to specification.
@@ -155,7 +225,11 @@ class CardDecorator(StepDecorator):
         # we need to ensure that `current.card` has `CardComponentCollector` instantiated only once.
         if not self._is_event_registered("pre-step"):
             self._register_event("pre-step")
-            current._update_env({"card": CardComponentCollector(self._logger)})
+            self._set_card_creator(CardCreator(self._create_top_level_args(flow)))
+
+            current._update_env(
+                {"card": CardComponentCollector(self._logger, self.card_creator)}
+            )
 
         # this line happens because of decospecs parsing.
         customize = False
@@ -165,8 +239,12 @@ class CardDecorator(StepDecorator):
         card_metadata = current.card._add_card(
             self.attributes["type"],
             self._user_set_card_id,
-            self._is_editable,
-            customize,
+            self.attributes,
+            self.card_options,
+            editable=self._is_editable,
+            customize=customize,
+            runtime_card=self._is_runtime_card,
+            refresh_interval=self.attributes["refresh_interval"],
         )
         self._card_uuid = card_metadata["uuid"]
 
@@ -176,17 +254,22 @@ class CardDecorator(StepDecorator):
         if self.step_counter == self.total_decos_on_step[step_name]:
             current.card._finalize()
 
-        self._task_datastore = task_datastore
-        self._metadata = metadata
-
     def task_finished(
         self, step_name, flow, graph, is_task_ok, retry_count, max_user_code_retries
     ):
-        if not is_task_ok:
-            return
-        component_strings = current.card._serialize_components(self._card_uuid)
-        runspec = "/".join([current.run_id, current.step_name, current.task_id])
-        self._run_cards_subprocess(runspec, component_strings)
+        create_options = dict(
+            card_uuid=self._card_uuid,
+            user_set_card_id=self._user_set_card_id,
+            runtime_card=self._is_runtime_card,
+            decorator_attributes=self.attributes,
+            card_options=self.card_options,
+            logger=self._logger,
+        )
+        if is_task_ok:
+            self.card_creator.create(mode="render", final=True, **create_options)
+            self.card_creator.create(mode="refresh", final=True, **create_options)
+
+        self._cleanup(step_name)
 
     @staticmethod
     def _options(mapping):
@@ -197,10 +280,13 @@ class CardDecorator(StepDecorator):
                 for value in v:
                     yield "--%s" % k
                     if not isinstance(value, bool):
-                        yield to_unicode(value)
+                        if isinstance(value, tuple):
+                            for val in value:
+                                yield to_unicode(val)
+                        else:
+                            yield to_unicode(value)
 
-    def _create_top_level_args(self):
-
+    def _create_top_level_args(self, flow):
         top_level_options = {
             "quiet": True,
             "metadata": self._metadata.TYPE,
@@ -213,68 +299,23 @@ class CardDecorator(StepDecorator):
             # We don't provide --with as all execution is taking place in
             # the context of the main process
         }
+        if self._config_values:
+            top_level_options["config-value"] = self._config_values
+            top_level_options["local-config-file"] = self._config_file_name
+
         return list(self._options(top_level_options))
 
-    def _run_cards_subprocess(self, runspec, component_strings):
-        temp_file = None
-        if len(component_strings) > 0:
-            temp_file = tempfile.NamedTemporaryFile("w", suffix=".json")
-            json.dump(component_strings, temp_file)
-            temp_file.seek(0)
-        executable = sys.executable
-        cmd = [
-            executable,
-            sys.argv[0],
-        ]
-        cmd += self._create_top_level_args() + [
-            "card",
-            "create",
-            runspec,
-            "--type",
-            self.attributes["type"],
-            # Add the options relating to card arguments.
-            # todo : add scope as a CLI arg for the create method.
-        ]
-        if self.card_options is not None and len(self.card_options) > 0:
-            cmd += ["--options", json.dumps(self.card_options)]
-        # set the id argument.
+    def task_exception(
+        self, exception, step_name, flow, graph, retry_count, max_user_code_retries
+    ):
+        self._cleanup(step_name)
 
-        if self.attributes["timeout"] is not None:
-            cmd += ["--timeout", str(self.attributes["timeout"])]
-
-        if self._user_set_card_id is not None:
-            cmd += ["--id", str(self._user_set_card_id)]
-
-        if self.attributes["save_errors"]:
-            cmd += ["--render-error-card"]
-
-        if temp_file is not None:
-            cmd += ["--component-file", temp_file.name]
-
-        response, fail = self._run_command(
-            cmd, os.environ, timeout=self.attributes["timeout"]
-        )
-        if fail:
-            resp = "" if response is None else response.decode("utf-8")
-            self._logger(
-                "Card render failed with error : \n\n %s" % resp,
-                timestamp=False,
-                bad=True,
-            )
-
-    def _run_command(self, cmd, env, timeout=None):
-        fail = False
-        timeout_args = {}
-        if timeout is not None:
-            timeout_args = dict(timeout=int(timeout) + 10)
-        try:
-            rep = subprocess.check_output(
-                cmd, env=env, stderr=subprocess.STDOUT, **timeout_args
-            )
-        except subprocess.CalledProcessError as e:
-            rep = e.output
-            fail = True
-        except subprocess.TimeoutExpired as e:
-            rep = e.output
-            fail = True
-        return rep, fail
+    def _cleanup(self, step_name):
+        self._increment_completed_counter()
+        if self.task_finished_decos == self.total_decos_on_step[step_name]:
+            # Unlink the config file if it exists
+            if self._config_file_name:
+                try:
+                    os.unlink(self._config_file_name)
+                except Exception as e:
+                    pass

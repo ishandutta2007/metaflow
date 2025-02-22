@@ -1,6 +1,7 @@
 from setuptools import setup, find_packages
 
-version = "2.10.3"
+with open("metaflow/version.py", mode="r") as f:
+    version = f.read().splitlines()[0].split("=")[1].strip(" \"'")
 
 setup(
     include_package_data=True,
@@ -18,13 +19,14 @@ setup(
         "Operating System :: MacOS :: MacOS X",
         "Operating System :: POSIX :: Linux",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.5",
         "Programming Language :: Python :: 3.6",
         "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
     ],
     project_urls={
         "Source": "https://github.com/Netflix/metaflow",
@@ -40,14 +42,15 @@ setup(
             "tutorials/*/*",
             "plugins/env_escape/configurations/*/*",
             "py.typed",
+            "**/*.pyi",
         ]
     },
     entry_points="""
         [console_scripts]
         metaflow=metaflow.cmd.main_cli:start
       """,
-    install_requires=[
-        "requests",
-        "boto3",
-    ],
+    install_requires=["requests", "boto3"],
+    extras_require={
+        "stubs": ["metaflow-stubs==%s" % version],
+    },
 )
